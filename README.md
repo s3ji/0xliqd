@@ -36,7 +36,7 @@ GetLiqd employs a multi-factor approach to identify high-probability reversal op
 - **RapidAPI Pro subscription ($6/month)** - Required for liquidation data
 - Discord webhook (optional)
 
-**Note**: A free alternative to the RapidAPI subscription is currently in development and will be available soon.
+**Note**: A free alternative to the RapidAPI subscription is currently in consideration.
 
 ### Installation
 
@@ -56,6 +56,31 @@ pip install -r requirements.txt
 4. Run the bot:
 ```bash
 python getliqd.py
+```
+
+### Running with PM2 (Recommended for VPS)
+
+For production deployment on a VPS, PM2 provides process management, auto-restart, and monitoring:
+
+1. Install PM2:
+```bash
+npm install -g pm2
+```
+
+2. Start the bot with PM2:
+```bash
+pm2 start getliqd.py --name "getliqd" --interpreter python3
+pm2 save
+pm2 startup
+```
+
+3. Useful PM2 commands:
+```bash
+pm2 status          # Check status
+pm2 logs getliqd     # View logs
+pm2 restart getliqd  # Restart bot
+pm2 stop getliqd     # Stop bot
+pm2 delete getliqd   # Remove from PM2
 ```
 
 ## ⚙️ Configuration (config.json)
