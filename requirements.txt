@@ -1,0 +1,13 @@
+# Core trading and exchange libraries
+ccxt
+aiohttp
+
+# Discord notifications
+discord-webhook
+
+# Binance WebSocket API
+unicorn-binance-websocket-api
+
+# Data processing and utilities
+asyncio-throttle
+python-dateutil
