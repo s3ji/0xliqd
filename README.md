@@ -2,6 +2,8 @@
 
 A sophisticated algorithmic trading bot that hunts liquidation events on Binance Futures to capture market reversals. The bot monitors real-time liquidation data and executes trades based on adaptive clustering analysis, volume spikes, and technical patterns.
 
+<img width="1891" height="965" alt="image" src="https://github.com/user-attachments/assets/243a88b8-4d37-4f48-a2ee-4c42105282e5" />
+
 ## ⚠️ Risk Warning
 
 **This software is for educational and testing purposes only. Trading cryptocurrencies involves substantial risk of loss and is not suitable for all investors. Never trade with money you cannot afford to lose. Past performance does not guarantee future results.**
