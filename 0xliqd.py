@@ -42,11 +42,12 @@ class VWAPConfig:
     vwap_enhancement: bool = True
 
 @dataclass
-class SmartDCAConfig:
-    """Smart DCA system configuration"""
+class DCAConfig:
+    """DCA system configuration"""
     enable: bool = True
     max_levels: int = 7
     trigger_pcts: List[float] = field(default_factory=lambda: [0.05, 0.07, 0.09, 0.11, 0.13, 0.15, 0.17])
+    size_multipliers: List[float] = field(default_factory=lambda: [1.5, 2, 2.5, 3, 3.5, 4, 4.5])
 
 @dataclass
 class ProfitProtectionConfig:
@@ -96,7 +97,7 @@ class Config:
     # Strategy Components
     rapidapi: RapidAPIConfig = field(default_factory=RapidAPIConfig)
     vwap: VWAPConfig = field(default_factory=VWAPConfig)
-    dca: SmartDCAConfig = field(default_factory=SmartDCAConfig)
+    dca: DCAConfig = field(default_factory=DCAConfig)
     profit_protection: ProfitProtectionConfig = field(default_factory=ProfitProtectionConfig)
     market_regime: MarketRegimeConfig = field(default_factory=MarketRegimeConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
@@ -121,7 +122,7 @@ def load_config() -> Config:
                 # Update main config
                 for key, value in file_config.items():
                     if hasattr(config, key) and not isinstance(getattr(config, key),
-                        (RapidAPIConfig, VWAPConfig, SmartDCAConfig, ProfitProtectionConfig, MarketRegimeConfig, RiskConfig, DebugConfig)):
+                        (RapidAPIConfig, VWAPConfig, DCAConfig, ProfitProtectionConfig, MarketRegimeConfig, RiskConfig, DebugConfig)):
                         setattr(config, key, value)
                 
                 # Update sub-configs
@@ -909,8 +910,7 @@ class PositionManager:
             closed = [s for s in self.positions if s not in active_positions]
             for s in closed:
                 # Calculate final P&L before removing position
-                if symbol in self.positions:
-                    await self._send_position_closed_alert(symbol, exchange)
+                await self._send_position_closed_alert(s, exchange)
 
                 logging.info(f"🔄 Removing closed position {s}")
                 del self.positions[s]
@@ -1069,7 +1069,7 @@ class PositionManager:
         # Check isolation limit with new DCA size
         total_notional_used = sum(p.total_notional_used for p in self.positions.values())
         balance = await get_account_balance(exchange)
-        isolation_limit = balance * CONFIG.risk.isolation_pct
+        isolation_limit = balance * CONFIG.risk.isolation_pct * CONFIG.leverage
         
         if total_notional_used + actual_notional > isolation_limit:
             logging.info(f"❌ DCA L{dca_level} {symbol}: Would exceed isolation limit "
