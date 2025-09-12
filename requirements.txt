@@ -1,13 +1,6 @@
-# Core trading and exchange libraries
-ccxt
-aiohttp
-
-# Discord notifications
-discord-webhook
-
-# Binance WebSocket API
-unicorn-binance-websocket-api
-
-# Data processing and utilities
-asyncio-throttle
-python-dateutil
+# Core dependencies
+ccxt            # Cryptocurrency exchange library
+websockets      # WebSocket client for real-time data
+aiohttp         # Async HTTP client for API calls
+numpy==1.24.*   # Numerical computations
+pyyaml          # Configuration file handling
