@@ -1,5 +1,11 @@
 # 0xLIQD – Liquidation Hunter Bot 🎯
 
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue)](https://python.org)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Binance](https://img.shields.io/badge/Exchange-Binance%20Futures-yellow)](https://accounts.binance.com/register?ref=43408019)
+
+<img width="498" height="212" alt="0xliqd" src="https://github.com/user-attachments/assets/981f4016-3ede-4d72-94db-70f2c05ab0df" />
+
 **0xLIQD** is a real-time liquidation hunting bot for Binance Futures. It monitors liquidation streams, calculates VWAP zones, and executes automated entries with DCA, fixed take-profit, and optional stop-loss.
 
 ## 🚀 Features
