@@ -240,6 +240,7 @@ class TradingStatistics:
             'existing_position': 0,
             'max_positions': 0,
             'volume_filter': 0,
+            'momentum_filter': 0,
             'no_zones': 0,
             'old_data': 0,
             'invalid_vwap': 0,
