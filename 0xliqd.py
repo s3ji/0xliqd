@@ -1562,8 +1562,9 @@ class PositionManager:
         self.profitable_trades = 0
         self._position_lock = asyncio.Lock()
         self.alert_sent_positions: set = set()
-        # Symbol-level locks to prevent race conditions
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        self.recent_attempts: Dict[str, float] = {}  # Track recent attempts per symbol
+        self.attempt_cooldown = 10  # seconds between attempts for same symbol
     
     def get_symbol_lock(self, symbol: str) -> asyncio.Lock:
         """Get or create symbol-specific lock"""
@@ -1749,25 +1750,70 @@ class PositionManager:
             logging.error(f"❌ Failed to send position closed alert for {symbol}: {e}")
     
     async def create_position(self, exchange, symbol: str, side: str, liq_price: float,
-                            liq_size: float, vwap_ref: float, regime: str,
-                            balance: float) -> Optional[Position]:
-        """Create new position with symbol lock"""
+                        liq_size: float, vwap_ref: float, regime: str,
+                        balance: float) -> Optional[Position]:
+        """Create new position with proper race condition protection"""
         symbol_lock = self.get_symbol_lock(symbol)
         async with symbol_lock:
             async with self._position_lock:
-                # Sync with exchange first
+
+                # STEP 0: Check attempt rate limiting
+                current_time = time.time()
+                last_attempt = self.recent_attempts.get(symbol, 0)
+                if current_time - last_attempt < self.attempt_cooldown:
+                    logging.info(f"❌ {symbol}: Too soon since last attempt ({current_time - last_attempt:.1f}s)")
+                    return None
+                
+                self.recent_attempts[symbol] = current_time
+                
+                # STEP 1: Fresh sync with exchange
                 active_positions = await self.sync_with_exchange(exchange)
                 
-                # Check if position already exists on exchange
+                # STEP 2: Check existing position for THIS symbol
                 if symbol in active_positions:
-                    logging.info(f"❌ {symbol}: Position already exists on exchange")
+                    logging.info(f"❌ {symbol}: Position exists on exchange")
+                    stats.log_filter_rejection('existing_position')
+                    return None
+                    
+                if symbol in self.positions:
+                    logging.info(f"❌ {symbol}: Position exists in memory")
                     stats.log_filter_rejection('existing_position')
                     return None
                 
-                # Check max positions
-                if len(active_positions) >= CONFIG.risk.max_positions:
-                    logging.info(f"❌ {symbol}: Max positions reached ({len(active_positions)}/{CONFIG.risk.max_positions})")
+                # STEP 3: Double-check with fresh exchange query for THIS symbol
+                try:
+                    fresh_positions = await exchange.fetch_positions([symbol])
+                    for pos in fresh_positions:
+                        if pos['contracts'] and float(pos['contracts']) != 0:
+                            logging.warning(f"❌ {symbol}: Fresh check found existing position")
+                            stats.log_filter_rejection('existing_position')
+                            return None
+                except Exception as e:
+                    logging.error(f"Fresh existing position check failed for {symbol}: {e}")
+                    return None  # Err on side of caution
+                
+                # STEP 4: Enhanced max position check (as previously discussed)
+                exchange_position_count = len(active_positions)
+                memory_position_count = len(self.positions)
+                actual_position_count = max(exchange_position_count, memory_position_count)
+                
+                if actual_position_count >= CONFIG.risk.max_positions:
+                    logging.warning(f"❌ {symbol}: Max positions reached "
+                                f"(Exchange: {exchange_position_count}, Memory: {memory_position_count})")
                     stats.log_filter_rejection('max_positions')
+                    return None
+                
+                # STEP 5: Final fresh count check
+                try:
+                    all_fresh_positions = await exchange.fetch_positions()
+                    fresh_total_count = len([p for p in all_fresh_positions 
+                                        if p['contracts'] and float(p['contracts']) != 0])
+                    if fresh_total_count >= CONFIG.risk.max_positions:
+                        logging.warning(f"❌ {symbol}: Fresh total count exceeds limit ({fresh_total_count})")
+                        stats.log_filter_rejection('max_positions')
+                        return None
+                except Exception as e:
+                    logging.error(f"Fresh total count check failed: {e}")
                     return None
                 
                 # RISK CHECK: Isolation percentage
@@ -2206,12 +2252,6 @@ class VWAPHunterStrategy:
             
             # Filter 2: Existing position check (WebSocket enhanced sync)
             await position_manager.sync_with_exchange(self.exchange)
-            
-            if position_manager.has_position(symbol):
-                stats.log_filter_rejection('existing_position')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.info(f"❌ {symbol}: Already have position")
-                return
             
             # Filter 3: Max positions check (use WebSocket when available)
             if ws_manager and ws_manager.is_data_fresh('positions'):
