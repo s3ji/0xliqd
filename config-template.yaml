@@ -68,6 +68,25 @@ market_regime:
   volatility_multiplier: 2.0 # ATR spike detection multiplier
   regime_filter: true        # Filter trades based on market regime
 
+# Momentum Detection
+momentum:
+  enable_momentum_filter: true
+  
+  # Daily thresholds
+  daily_pump_threshold: 12.0    # Avoid if pumped in 24h
+  daily_dump_threshold: -12.0   # Avoid if dumped in 24h
+  
+  # Hourly thresholds  
+  hourly_pump_threshold: 5.0    # Avoid if pumped in 1h
+  hourly_dump_threshold: -5.0   # Avoid if dumped in 1h
+  
+  # Volatility limits
+  min_daily_volatility: 3.0     # Avoid if daily range
+  max_daily_volatility: 30.0    # Avoid if daily range
+  
+  # Strategy mode
+  momentum_mode: "AVOID_EXTREMES"  # AVOID_EXTREMES, TARGET_MOMENTUM, ENHANCE_SIGNALS
+
 # Risk Management
 risk:
   isolation_pct: 1.0

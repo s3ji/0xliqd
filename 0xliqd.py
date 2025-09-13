@@ -83,6 +83,30 @@ class DebugConfig:
     stats_interval_minutes: int = 5
 
 @dataclass
+class MomentumConfig:
+    """Momentum detection configuration"""
+    enable_momentum_filter: bool = True
+    
+    # Daily momentum thresholds
+    daily_pump_threshold: float = 15.0  # % daily gain to consider "pumped"
+    daily_dump_threshold: float = -10.0  # % daily loss to consider "dumped"
+    
+    # Hourly momentum thresholds (more sensitive)
+    hourly_pump_threshold: float = 8.0   # % hourly gain
+    hourly_dump_threshold: float = -6.0  # % hourly loss
+    
+    # Volatility thresholds
+    min_daily_volatility: float = 5.0    # Minimum daily range %
+    max_daily_volatility: float = 50.0   # Maximum daily range %
+    
+    # Strategy modes
+    momentum_mode: str = "AVOID_EXTREMES"  # AVOID_EXTREMES, TARGET_MOMENTUM, ENHANCE_SIGNALS
+    
+    # Lookback periods
+    momentum_lookback_hours: int = 24
+    volatility_lookback_hours: int = 24
+
+@dataclass
 class Config:
     """Main configuration class"""
     # API Configuration
@@ -102,6 +126,7 @@ class Config:
     market_regime: MarketRegimeConfig = field(default_factory=MarketRegimeConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
+    momentum: MomentumConfig = field(default_factory=MomentumConfig)
     
     # System Settings
     enable_discord: bool = True
@@ -122,11 +147,11 @@ def load_config() -> Config:
                 # Update main config
                 for key, value in file_config.items():
                     if hasattr(config, key) and not isinstance(getattr(config, key),
-                        (RapidAPIConfig, VWAPConfig, DCAConfig, ProfitProtectionConfig, MarketRegimeConfig, RiskConfig, DebugConfig)):
+                        (RapidAPIConfig, VWAPConfig, DCAConfig, ProfitProtectionConfig, MarketRegimeConfig, RiskConfig, DebugConfig, MomentumConfig)):
                         setattr(config, key, value)
                 
                 # Update sub-configs
-                for sub_config_name in ['rapidapi', 'vwap', 'dca', 'profit_protection', 'market_regime', 'risk', 'debug']:
+                for sub_config_name in ['rapidapi', 'vwap', 'dca', 'profit_protection', 'market_regime', 'risk', 'debug', 'momentum']:
                     if sub_config_name in file_config:
                         sub_config = getattr(config, sub_config_name)
                         for key, value in file_config[sub_config_name].items():
@@ -838,6 +863,192 @@ async def get_account_balance(exchange) -> float:
     except Exception as e:
         logging.warning(f"Balance fetch failed: {e}")
         return 1000.0
+
+# =============================================================================
+# MOMENTUM/VOLATILITY DETECTOR
+# =============================================================================
+
+class MomentumDetector:
+    """Detect momentum and volatility using WebSocket kline data"""
+    
+    def __init__(self, ws_manager: BinanceWebSocketManager):
+        self.ws_manager = ws_manager
+        self.momentum_cache: Dict[str, Dict] = {}
+    
+    def calculate_momentum_metrics(self, symbol: str) -> Dict[str, float]:
+        """Calculate various momentum and volatility metrics"""
+        try:
+            # Get kline data from WebSocket (1m bars)
+            klines = self.ws_manager.get_kline_data(symbol, limit=1440)  # 24 hours of 1m data
+            
+            if len(klines) < 60:  # Need at least 1 hour of data
+                return {}
+            
+            # Convert to price data
+            prices = [float(kline[4]) for kline in klines]  # closing prices
+            highs = [float(kline[2]) for kline in klines]   # highs
+            lows = [float(kline[3]) for kline in klines]    # lows
+            volumes = [float(kline[5]) for kline in klines] # volumes
+            
+            current_price = prices[-1]
+            
+            # Calculate different timeframe moves
+            metrics = {}
+            
+            # 1-hour momentum (last 60 minutes)
+            if len(prices) >= 60:
+                hour_start = prices[-60]
+                metrics['1h_change_pct'] = ((current_price - hour_start) / hour_start) * 100
+            
+            # 4-hour momentum
+            if len(prices) >= 240:
+                four_hour_start = prices[-240]
+                metrics['4h_change_pct'] = ((current_price - four_hour_start) / four_hour_start) * 100
+            
+            # 24-hour momentum (full lookback)
+            if len(prices) >= 1440:
+                day_start = prices[0]
+                metrics['24h_change_pct'] = ((current_price - day_start) / day_start) * 100
+            elif len(prices) >= 60:
+                # Use available data if less than 24h
+                day_start = prices[0]
+                metrics['24h_change_pct'] = ((current_price - day_start) / day_start) * 100
+            
+            # Volatility metrics
+            if len(prices) >= 240:  # 4 hours minimum for volatility
+                # Daily high/low range
+                recent_high = max(highs[-1440:] if len(highs) >= 1440 else highs)
+                recent_low = min(lows[-1440:] if len(lows) >= 1440 else lows)
+                metrics['daily_range_pct'] = ((recent_high - recent_low) / recent_low) * 100
+                
+                # Price volatility (standard deviation)
+                import numpy as np
+                price_changes = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
+                metrics['volatility_1h'] = float(np.std(price_changes[-60:]) * 100) if len(price_changes) >= 60 else 0
+                metrics['volatility_4h'] = float(np.std(price_changes[-240:]) * 100) if len(price_changes) >= 240 else 0
+                
+                # Volume spike detection
+                avg_volume = sum(volumes[-240:]) / len(volumes[-240:]) if len(volumes) >= 240 else sum(volumes) / len(volumes)
+                current_volume = sum(volumes[-60:]) / 60 if len(volumes) >= 60 else volumes[-1]
+                metrics['volume_spike_ratio'] = current_volume / avg_volume if avg_volume > 0 else 1
+            
+            # Cache the results
+            self.momentum_cache[symbol] = {
+                'metrics': metrics,
+                'timestamp': time.time(),
+                'price': current_price
+            }
+            
+            return metrics
+            
+        except Exception as e:
+            logging.warning(f"Momentum calculation failed for {symbol}: {e}")
+            return {}
+    
+    def get_momentum_signal(self, symbol: str) -> Tuple[str, str, Dict]:
+        """
+        Get momentum signal for a symbol
+        Returns: (signal, reason, metrics)
+        signal: ALLOW, AVOID, ENHANCE_LONG, ENHANCE_SHORT
+        """
+        try:
+            # Get or calculate metrics
+            cached = self.momentum_cache.get(symbol)
+            if cached and time.time() - cached['timestamp'] < 300:  # 5 min cache
+                metrics = cached['metrics']
+            else:
+                metrics = self.calculate_momentum_metrics(symbol)
+            
+            if not metrics:
+                return "ALLOW", "No momentum data", {}
+            
+            # Extract key metrics
+            change_1h = metrics.get('1h_change_pct', 0)
+            change_4h = metrics.get('4h_change_pct', 0)
+            change_24h = metrics.get('24h_change_pct', 0)
+            daily_range = metrics.get('daily_range_pct', 0)
+            volume_spike = metrics.get('volume_spike_ratio', 1)
+            
+            # Apply strategy based on mode
+            mode = CONFIG.momentum.momentum_mode
+            
+            if mode == "AVOID_EXTREMES":
+                # Avoid entering positions on extreme moves
+                if change_24h >= CONFIG.momentum.daily_pump_threshold:
+                    return "AVOID", f"Over-pumped: +{change_24h:.1f}% (24h)", metrics
+                elif change_24h <= CONFIG.momentum.daily_dump_threshold:
+                    return "AVOID", f"Over-dumped: {change_24h:.1f}% (24h)", metrics
+                elif change_1h >= CONFIG.momentum.hourly_pump_threshold:
+                    return "AVOID", f"Recent pump: +{change_1h:.1f}% (1h)", metrics
+                elif change_1h <= CONFIG.momentum.hourly_dump_threshold:
+                    return "AVOID", f"Recent dump: {change_1h:.1f}% (1h)", metrics
+                elif daily_range >= CONFIG.momentum.max_daily_volatility:
+                    return "AVOID", f"Excessive volatility: {daily_range:.1f}%", metrics
+                elif daily_range <= CONFIG.momentum.min_daily_volatility:
+                    return "AVOID", f"Low volatility: {daily_range:.1f}%", metrics
+                else:
+                    return "ALLOW", f"Normal momentum: {change_24h:+.1f}% (24h), {change_1h:+.1f}% (1h)", metrics
+            
+            elif mode == "TARGET_MOMENTUM":
+                # Target symbols with good momentum for continuation
+                if abs(change_24h) >= 5 and abs(change_1h) <= 3 and volume_spike >= 1.5:
+                    if change_24h > 0:
+                        return "ENHANCE_LONG", f"Bullish momentum: +{change_24h:.1f}% (24h), cooling off", metrics
+                    else:
+                        return "ENHANCE_SHORT", f"Bearish momentum: {change_24h:.1f}% (24h), cooling off", metrics
+                elif daily_range >= CONFIG.momentum.min_daily_volatility * 2:
+                    return "ALLOW", f"High volatility target: {daily_range:.1f}%", metrics
+                else:
+                    return "AVOID", f"Insufficient momentum: {change_24h:+.1f}% (24h)", metrics
+            
+            elif mode == "ENHANCE_SIGNALS":
+                # Use momentum to enhance existing signals
+                momentum_score = 0
+                
+                # Score based on various factors
+                if 2 <= abs(change_24h) <= 12:  # Good daily move, not extreme
+                    momentum_score += 1
+                if abs(change_1h) <= 2:  # Not moving too fast recently
+                    momentum_score += 1
+                if CONFIG.momentum.min_daily_volatility <= daily_range <= CONFIG.momentum.max_daily_volatility:
+                    momentum_score += 1
+                if volume_spike >= 1.2:  # Some volume interest
+                    momentum_score += 1
+                
+                if momentum_score >= 3:
+                    return "ALLOW", f"Good momentum profile (score: {momentum_score}/4)", metrics
+                elif momentum_score >= 2:
+                    return "ALLOW", f"Acceptable momentum (score: {momentum_score}/4)", metrics
+                else:
+                    return "AVOID", f"Poor momentum profile (score: {momentum_score}/4)", metrics
+            
+            return "ALLOW", "Default allow", metrics
+            
+        except Exception as e:
+            logging.error(f"Momentum signal error for {symbol}: {e}")
+            return "ALLOW", "Error in momentum calculation", {}
+    
+    def get_momentum_summary(self, symbol: str) -> str:
+        """Get a human-readable momentum summary"""
+        try:
+            signal, reason, metrics = self.get_momentum_signal(symbol)
+            
+            if not metrics:
+                return f"{signal}: {reason}"
+            
+            change_1h = metrics.get('1h_change_pct', 0)
+            change_24h = metrics.get('24h_change_pct', 0)
+            daily_range = metrics.get('daily_range_pct', 0)
+            volume_spike = metrics.get('volume_spike_ratio', 1)
+            
+            summary = f"{signal}: {reason}\n"
+            summary += f"  24h: {change_24h:+.1f}%, 1h: {change_1h:+.1f}%\n"
+            summary += f"  Range: {daily_range:.1f}%, Vol: {volume_spike:.1f}x"
+            
+            return summary
+            
+        except Exception as e:
+            return f"Error: {e}"
 
 # =============================================================================
 # RAPIDAPI CLIENT
@@ -1863,6 +2074,13 @@ class VWAPHunterStrategy:
         self.price_cache: Dict[str, float] = {}
         self.last_price_update: Dict[str, float] = {}
         self.entry_timestamps: Dict[str, float] = {}
+
+        # Add momentum detector
+        global ws_manager
+        if ws_manager:
+            self.momentum_detector = MomentumDetector(ws_manager)
+        else:
+            self.momentum_detector = None
     
     async def get_current_price(self, symbol: str) -> float:
         """Get current price with WebSocket priority"""
@@ -2015,6 +2233,26 @@ class VWAPHunterStrategy:
                     logging.info(f"❌ {symbol}: Volume too low (${daily_volume:,.0f} < ${CONFIG.risk.min_24h_volume:,.0f})")
                 return
             
+            # ADD MOMENTUM FILTER
+            if CONFIG.momentum.enable_momentum_filter and self.momentum_detector:
+                # Ensure symbol is subscribed for momentum data
+                if ws_manager:
+                    ws_manager.subscribe_symbol(symbol)
+                
+                # Get momentum signal
+                momentum_signal, momentum_reason, momentum_metrics = self.momentum_detector.get_momentum_signal(symbol)
+                
+                if momentum_signal == "AVOID":
+                    stats.log_filter_rejection('momentum_filter')
+                    if CONFIG.debug.enable_filter_debug:
+                        logging.info(f"❌ {symbol}: Momentum filter - {momentum_reason}")
+                    return
+                
+                # Log momentum info for successful signals
+                if CONFIG.debug.enable_trade_debug:
+                    debug_logger = logging.getLogger('trade_debug')
+                    debug_logger.debug(f"📈 MOMENTUM {symbol}: {momentum_reason}")
+            
             # Filter 5: Zones data check
             if not rapidapi_client.has_zones(symbol):
                 stats.log_filter_rejection('no_zones')
@@ -2049,6 +2287,13 @@ class VWAPHunterStrategy:
                 if CONFIG.debug.enable_filter_debug:
                     logging.info(f"❌ {symbol}: Invalid VWAP levels (L:{long_level:.6f} S:{short_level:.6f})")
                 return
+
+            # OPTIONAL: Use momentum to enhance entry signals
+            if self.momentum_detector and momentum_signal in ["ENHANCE_LONG", "ENHANCE_SHORT"]:
+                # You could adjust position size or be more aggressive with entry levels
+                if CONFIG.debug.enable_trade_debug:
+                    debug_logger = logging.getLogger('trade_debug')
+                    debug_logger.debug(f"🚀 MOMENTUM ENHANCEMENT: {symbol} - {momentum_reason}")
             
             # === ENTRY SIGNAL ANALYSIS ===
             entry_valid = False
