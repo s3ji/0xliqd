@@ -4,7 +4,6 @@ api_secret: ""
 discord_webhook_url: ""
 
 # Core Strategy Settings
-risk_pct: 0.05              # Risk per trade
 leverage: 10                # Trading leverage
 min_notional: 11            # Minimum trade size in USDT
 
