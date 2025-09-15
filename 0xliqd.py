@@ -15,6 +15,8 @@ import yaml
 from pathlib import Path
 import signal
 import sys
+import statistics
+import websockets
 
 # =============================================================================
 # CONFIGURATION
@@ -351,6 +353,15 @@ Failed DCAs: {self.failed_dcas}
             for symbol, data in top_symbols:
                 summary += f"  {symbol}: {data['count']} liquidations (${data['total_size']:,.0f})\n"
         
+        # Add timestamp status if available
+        global timestamp_manager
+        if timestamp_manager:
+            ts_status = timestamp_manager.get_status()
+            summary += f"\n\nTimestamp Management:\n"
+            summary += f"  Current Offset: {ts_status['current_offset']:.0f}ms\n"
+            summary += f"  Last Calibration: {ts_status['calibration_age_minutes']:.1f} minutes ago\n"
+            summary += f"  Total Calibrations: {ts_status['calibration_count']}\n"
+
         return summary
 
 stats = TradingStatistics()
@@ -459,13 +470,13 @@ class CCXTProDataManager:
                     await asyncio.sleep(5)
     
     def subscribe_symbol(self, symbol: str):
-        """Subscribe to symbol for price and OHLCV data"""
+        """Optimized subscription"""
         normalized = normalize_symbol(symbol)
-        if normalized.endswith('USDT'):
+        if normalized.endswith('USDT') and normalized not in self.subscribed_symbols:
             self.subscribed_symbols.add(normalized)
             if self.is_streaming:
+                # Only subscribe if not already subscribed
                 asyncio.create_task(self._stream_symbol_data(normalized))
-            logging.debug(f"📡 Subscribed to {normalized}")
     
     async def _stream_symbol_data(self, symbol: str):
         """Stream price and OHLCV data for a symbol"""
@@ -607,26 +618,60 @@ data_manager: Optional[CCXTProDataManager] = None
 # DISCORD NOTIFICATIONS
 # =============================================================================
 
-class PremiumDiscordNotifier:
-    """Premium Discord notifications"""
+class DiscordNotifier:
+    """Enhanced Discord notifications with better error handling"""
     
     def __init__(self, webhook_url: str):
         self.webhook_url = webhook_url
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_sent = 0
-        self.rate_limit = 2
+        self.rate_limit = 1
+        self.is_initialized = False
+        
+        logging.info(f"Discord notifier initialized with webhook: {webhook_url[:50]}...")
     
     async def initialize(self):
-        if not self.session or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=15)
-            self.session = aiohttp.ClientSession(timeout=timeout)
+        """Initialize with better error handling"""
+        try:
+            if not self.session or self.session.closed:
+                timeout = aiohttp.ClientTimeout(total=30)  # Increased timeout
+                connector = aiohttp.TCPConnector(limit=10, limit_per_host=5)
+                self.session = aiohttp.ClientSession(
+                    timeout=timeout, 
+                    connector=connector,
+                    headers={'User-Agent': '0xLIQD-Bot/1.0'}
+                )
+                self.is_initialized = True
+                logging.debug("Discord session initialized")
+        except Exception as e:
+            logging.error(f"Discord initialization failed: {e}")
+            self.is_initialized = False
+    
+    async def _send_webhook(self, payload: dict, max_retries: int = 2) -> bool:
+        for attempt in range(max_retries):
+            try:
+                await self.initialize()
+                async with self.session.post(self.webhook_url, json=payload) as response:
+                    return response.status == 204
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                logging.warning(f"Discord send failed: {e}")
+        return False
     
     async def send_startup_alert(self, zones_count: int, pairs_count: int):
         """Send enhanced startup notification"""
         try:
+            # Check rate limit
+            now = time.time()
+            if now - self.last_sent < self.rate_limit:
+                logging.debug("Discord startup alert rate limited")
+                return
+            
             embed = {
                 "title": "⚡ 0xLIQD - ACTIVE",
-                "description": f"```Real-time liquidation hunting bot for Binance Futures. It monitors liquidation streams, calculates VWAP zones, and executes automated entries with DCA, fixed take-profit, and optional stop-loss.```",
+                "description": "```Real-time liquidation hunting bot for Binance Futures. Monitoring liquidation streams, calculating VWAP zones, and executing automated entries with DCA and profit protection.```",
                 "color": 0x00ff88,
                 "fields": [
                     {
@@ -637,39 +682,57 @@ class PremiumDiscordNotifier:
                     {
                         "name": "🔧 Data Status",
                         "value": f"**Zones:** {zones_count}\n**Pairs:** {pairs_count}\n**Max Positions:** {CONFIG.risk.max_positions}",
-                        "inline": False
+                        "inline": True
+                    },
+                    {
+                        "name": "🎯 Strategy",
+                        "value": f"**Leverage:** {CONFIG.leverage}x\n**TP:** {CONFIG.profit_protection.initial_tp_pct*100:.1f}%\n**Momentum Filter:** {'ON' if CONFIG.momentum.enable_momentum_filter else 'OFF'}",
+                        "inline": True
                     }
                 ],
                 "footer": {"text": "Powered by 0xLIQD"},
                 "timestamp": datetime.utcnow().isoformat()
             }
             
-            await self.initialize()
             payload = {"username": "⚡ 0xLIQD", "embeds": [embed]}
             
-            async with self.session.post(self.webhook_url, json=payload) as response:
-                if response.status == 204:
-                    logging.info("Startup notification sent")
-                    
+            success = await self._send_webhook(payload)
+            if success:
+                self.last_sent = now
+                logging.info("✅ Startup notification sent to Discord")
+            else:
+                logging.warning("❌ Failed to send startup notification")
+                
         except Exception as e:
-            logging.warning(f"Startup notification failed: {e}")
+            logging.error(f"Startup notification error: {e}")
     
     async def send_trade_alert(self, symbol: str, side: str, qty: float, price: float,
                              reason: str, notional: float, is_dca: bool = False, dca_level: int = 0):
-        """Send trade alert"""
-        now = time.time()
-        if now - self.last_sent < self.rate_limit:
-            return
-        
+        """Send trade alert with improved formatting"""
         try:
+            # Check rate limit
+            now = time.time()
+            if now - self.last_sent < self.rate_limit:
+                logging.debug(f"Discord trade alert rate limited for {symbol}")
+                return
+            
             color = 0x00ff88 if side == "buy" else 0xff6b6b
             
             if is_dca:
                 title = f"🔥 DCA L{dca_level} • {symbol}"
                 description = f"```{side.upper()} ${notional:.2f} @ {price:.6f}```"
+                emoji = "📈" if side == "buy" else "📉"
             else:
                 title = f"⚡ ENTRY • {symbol}"
                 description = f"```{side.upper()} ${notional:.2f} @ {price:.6f}```"
+                emoji = "🎯"
+            
+            # Add current timestamp info
+            global timestamp_manager
+            ts_status = ""
+            if timestamp_manager:
+                status = timestamp_manager.get_status()
+                ts_status = f"\n**Timestamp Offset:** {status['current_offset']:.0f}ms"
             
             embed = {
                 "title": title,
@@ -678,35 +741,47 @@ class PremiumDiscordNotifier:
                 "fields": [
                     {
                         "name": "💰 Trade Details",
-                        "value": f"**Notional:** ${notional:.2f}\n**Quantity:** {qty:.6f}\n**Leverage:** {CONFIG.leverage}x",
+                        "value": f"**Notional:** ${notional:.2f}\n**Quantity:** {qty:.6f}\n**Leverage:** {CONFIG.leverage}x{ts_status}",
                         "inline": True
                     },
                     {
-                        "name": "🎯 Entry Reason",
-                        "value": reason,
+                        "name": f"{emoji} Entry Reason",
+                        "value": reason[:100] + ("..." if len(reason) > 100 else ""),
                         "inline": True
                     }
                 ],
-                "timestamp": datetime.utcnow().isoformat()
+                "timestamp": datetime.utcnow().isoformat(),
+                "footer": {"text": f"0xLIQD • {datetime.now().strftime('%H:%M:%S')}"}
             }
             
-            await self.initialize()
             payload = {"username": "⚡ 0xLIQD", "embeds": [embed]}
             
-            async with self.session.post(self.webhook_url, json=payload) as response:
-                if response.status == 204:
-                    self.last_sent = now
-                    
+            success = await self._send_webhook(payload)
+            if success:
+                self.last_sent = now
+                logging.info(f"✅ Trade alert sent: {symbol} {side}")
+            else:
+                logging.warning(f"❌ Failed to send trade alert for {symbol}")
+                
         except Exception as e:
-            logging.warning(f"Trade alert failed: {e}")
+            logging.error(f"Trade alert error for {symbol}: {e}")
     
     async def send_profit_alert(self, symbol: str, pnl_pct: float, pnl_usd: float,
                               action: str, price: float):
         """Send enhanced profit/loss alert"""
         try:
+            # Check rate limit
+            now = time.time()
+            if now - self.last_sent < self.rate_limit:
+                logging.debug(f"Discord P&L alert rate limited for {symbol}")
+                return
+            
             color = 0x00ff00 if pnl_pct > 0 else 0xff0000
             emoji = "🎉" if pnl_pct > 0 else "⚠️"
             result = "WIN 🟢" if pnl_pct > 0 else "LOSS 🔴"
+            
+            # Add performance context
+            performance_emoji = "🚀" if pnl_pct >= 1 else "📈" if pnl_pct > 0 else "📉" if pnl_pct >= -2 else "💥"
             
             embed = {
                 "title": f"{emoji} {result} • {symbol}",
@@ -715,12 +790,12 @@ class PremiumDiscordNotifier:
                 "fields": [
                     {
                         "name": "💵 Results",
-                        "value": f"**P&L:** {pnl_pct:+.2f}%\n**USD:** ${pnl_usd:+.2f}",
+                        "value": f"**P&L:** {pnl_pct:+.2f}% {performance_emoji}\n**USD:** ${pnl_usd:+.2f}",
                         "inline": True
                     },
                     {
                         "name": "📊 Details",
-                        "value": f"**Exit:** {action}\n**Price:** {price:.6f}",
+                        "value": f"**Exit:** {action}\n**Price:** {price:.6f}\n**Time:** {datetime.now().strftime('%H:%M:%S')}",
                         "inline": True
                     }
                 ],
@@ -728,60 +803,319 @@ class PremiumDiscordNotifier:
                 "footer": {"text": "Powered by 0xLIQD"}
             }
             
-            await self.initialize()
             payload = {"username": "💰 0xLIQD P&L", "embeds": [embed]}
             
-            async with self.session.post(self.webhook_url, json=payload) as response:
-                if response.status == 204:
-                    logging.info(f"P&L alert sent: {symbol} {pnl_pct:+.2f}%")
-                    
+            success = await self._send_webhook(payload)
+            if success:
+                self.last_sent = now
+                logging.info(f"✅ P&L alert sent: {symbol} {pnl_pct:+.2f}%")
+            else:
+                logging.warning(f"❌ Failed to send P&L alert for {symbol}")
+                
         except Exception as e:
-            logging.warning(f"P&L alert failed: {e}")
+            logging.error(f"P&L alert error for {symbol}: {e}")
+    
+    async def send_stats_update(self, summary: str):
+        """Send periodic stats update"""
+        try:
+            # Less strict rate limiting for stats
+            now = time.time()
+            if now - self.last_sent < 1:
+                return
+            
+            # Truncate summary to fit Discord limits
+            truncated_summary = summary[:1800] if len(summary) > 1800 else summary
+            
+            embed = {
+                "title": "📊 Trading Statistics",
+                "description": f"```{truncated_summary}```",
+                "color": 0x00ff88,
+                "timestamp": datetime.utcnow().isoformat(),
+                "footer": {"text": f"0xLIQD Stats • {datetime.now().strftime('%H:%M')}"}
+            }
+            
+            payload = {"username": "📊 0xLIQD Stats", "embeds": [embed]}
+            
+            success = await self._send_webhook(payload)
+            if success:
+                self.last_sent = now
+                logging.info("✅ Stats update sent to Discord")
+            else:
+                logging.debug("❌ Failed to send stats update")
+                
+        except Exception as e:
+            logging.error(f"Stats update error: {e}")
     
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        """Clean shutdown"""
+        try:
+            if self.session and not self.session.closed:
+                await self.session.close()
+                logging.debug("Discord session closed")
+        except Exception as e:
+            logging.warning(f"Discord close error: {e}")
 
 # Initialize Discord notifier
 discord_notifier = None
 if CONFIG.enable_discord and CONFIG.discord_webhook_url:
-    discord_notifier = PremiumDiscordNotifier(CONFIG.discord_webhook_url)
+    discord_notifier = DiscordNotifier(CONFIG.discord_webhook_url)
+    logging.info("🎯 Discord notifier created")
+else:
+    logging.warning("⚠️ Discord notifications disabled (missing config)")
+
+# =============================================================================
+# TIMESTAMP MANAGER
+# =============================================================================
+
+class PeriodicTimestampManager:
+    """Manages timestamp synchronization with periodic recalibration"""
+    
+    def __init__(self, exchange):
+        self.exchange = exchange
+        self.forced_offset = 0
+        self.calibrated = False
+        self.last_calibration = 0
+        self.calibration_interval = 300  # Recalibrate every 5 minutes
+        self.monitoring_task = None
+        self.is_running = False
+        
+        # Statistics tracking
+        self.calibration_history = []
+        self.max_history = 20
+        
+    async def calibrate_forced_offset(self):
+        """Determine how much we need to adjust our timestamps"""
+        try:
+            logging.info("Calibrating timestamp offset...")
+            
+            # Take multiple samples for accuracy
+            samples = []
+            
+            for i in range(5):
+                try:
+                    local_before = time.time() * 1000  # Use system time instead of exchange time
+                    server_time = await self.exchange.fetch_time()
+                    local_after = time.time() * 1000
+                    
+                    # Account for network round-trip time
+                    network_delay = (local_after - local_before) / 2
+                    local_mid = local_before + network_delay
+                    
+                    # Calculate offset
+                    offset = server_time - local_mid
+                    samples.append(offset)
+                    
+                    logging.debug(f"Sample {i+1}: offset={offset:.0f}ms")
+                    
+                except Exception as e:
+                    logging.warning(f"Sample {i+1} failed: {e}")
+                    continue
+                
+                if i < 4:  # Don't sleep after last sample
+                    await asyncio.sleep(0.5)
+            
+            if not samples:
+                raise Exception("All calibration samples failed")
+            
+            # Use median to filter out outliers
+            median_offset = statistics.median(samples)
+            
+            # Add safety margin (be conservative - stay behind server time)
+            safety_margin = 2000  # 2 seconds
+            self.forced_offset = median_offset - safety_margin
+            
+            # Track calibration history
+            self.calibration_history.append({
+                'timestamp': time.time(),
+                'offset': self.forced_offset,
+                'samples': len(samples),
+                'raw_offset': median_offset
+            })
+            
+            # Keep only recent history
+            if len(self.calibration_history) > self.max_history:
+                self.calibration_history.pop(0)
+            
+            self.last_calibration = time.time()
+            self.calibrated = True
+            
+            logging.info(f"Calibration complete: offset={self.forced_offset:.0f}ms "
+                        f"(raw: {median_offset:.0f}ms, safety: {safety_margin}ms)")
+            
+            return True
+            
+        except Exception as e:
+            logging.error(f"Calibration failed: {e}")
+            
+            # Use historical average if available
+            if self.calibration_history:
+                avg_offset = statistics.mean([h['offset'] for h in self.calibration_history])
+                self.forced_offset = avg_offset
+                logging.warning(f"Using historical average offset: {self.forced_offset:.0f}ms")
+                self.calibrated = True
+                return True
+            
+            # Ultimate fallback
+            self.forced_offset = -3000
+            self.calibrated = True
+            logging.warning(f"Using emergency fallback offset: {self.forced_offset}ms")
+            return False
+    
+    def get_adjusted_timestamp(self):
+        """Get timestamp adjusted for Binance"""
+        return int(time.time() * 1000 + self.forced_offset)
+    
+    async def configure_exchange(self):
+        """Configure exchange with timestamp adjustment"""
+        if not self.calibrated:
+            await self.calibrate_forced_offset()
+        
+        # Override the exchange's milliseconds function
+        def adjusted_milliseconds():
+            return self.get_adjusted_timestamp()
+        
+        # Monkey patch
+        self.exchange.milliseconds = adjusted_milliseconds
+        
+        # Configure exchange options
+        self.exchange.options.update({
+            'recvWindow': 25000,  # 25 seconds (generous but not excessive)
+            'adjustForTimeDifference': False,
+            'timeDifference': 0,
+        })
+        
+        logging.info("Exchange configured with periodic timestamp management")
+    
+    async def start_monitoring(self):
+        """Start the periodic monitoring task"""
+        if self.is_running:
+            return
+        
+        self.is_running = True
+        self.monitoring_task = asyncio.create_task(self._monitoring_loop())
+        logging.info("Timestamp monitoring started")
+    
+    async def stop_monitoring(self):
+        """Stop the periodic monitoring task"""
+        self.is_running = False
+        
+        if self.monitoring_task and not self.monitoring_task.done():
+            self.monitoring_task.cancel()
+            try:
+                await asyncio.wait_for(self.monitoring_task, timeout=2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        
+        logging.info("Timestamp monitoring stopped")
+    
+    async def _monitoring_loop(self):
+        """Background monitoring loop"""
+        while self.is_running:
+            try:
+                current_time = time.time()
+                
+                # Check if recalibration is needed
+                if current_time - self.last_calibration >= self.calibration_interval:
+                    old_offset = self.forced_offset
+                    
+                    success = await self.calibrate_forced_offset()
+                    
+                    if success:
+                        offset_change = abs(self.forced_offset - old_offset)
+                        if offset_change > 500:  # More than 500ms change
+                            logging.warning(f"Significant offset change detected: "
+                                          f"{old_offset:.0f}ms -> {self.forced_offset:.0f}ms")
+                        
+                        # Update exchange configuration
+                        def adjusted_milliseconds():
+                            return self.get_adjusted_timestamp()
+                        
+                        self.exchange.milliseconds = adjusted_milliseconds
+                
+                # Sleep until next check (but wake up if stopped)
+                sleep_time = min(60, self.calibration_interval)  # Check at least every minute
+                
+                for _ in range(sleep_time):
+                    if not self.is_running:
+                        break
+                    await asyncio.sleep(1)
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Timestamp monitoring error: {e}")
+                await asyncio.sleep(30)  # Back off on errors
+    
+    def get_status(self):
+        """Get current status information"""
+        return {
+            'calibrated': self.calibrated,
+            'current_offset': self.forced_offset,
+            'last_calibration': self.last_calibration,
+            'calibration_age_minutes': (time.time() - self.last_calibration) / 60,
+            'calibration_count': len(self.calibration_history),
+            'is_monitoring': self.is_running
+        }
+
+# Global timestamp manager
+timestamp_manager: Optional[PeriodicTimestampManager] = None
+
+async def initialize_timestamp_management(exchange):
+    """Initialize and start periodic timestamp management"""
+    global timestamp_manager
+    
+    try:
+        timestamp_manager = PeriodicTimestampManager(exchange)
+        
+        # Initial configuration
+        await timestamp_manager.configure_exchange()
+        
+        # Start periodic monitoring
+        await timestamp_manager.start_monitoring()
+        
+        # Test the configuration
+        test_time = await exchange.fetch_time()
+        logging.info(f"Timestamp management initialized successfully. Server time: {test_time}")
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Timestamp management initialization failed: {e}")
+        return False
+
+async def cleanup_timestamp_management():
+    """Clean up timestamp management and order monitoring"""
+    global timestamp_manager
+    
+    if timestamp_manager:
+        await timestamp_manager.stop_monitoring()
+        timestamp_manager = None
+    
+    # Also stop profit protection monitoring
+    if profit_protection:
+        await profit_protection.stop_order_monitoring()
 
 # =============================================================================
 # EXCHANGE INTERFACE
 # =============================================================================
 
 def get_exchange():
-    """Get configured Binance USDM exchange instance with CCXT Pro"""
-    return ccxtpro.binanceusdm({
+    """Get configured Binance exchange"""
+    exchange = ccxtpro.binanceusdm({
         'apiKey': CONFIG.api_key,
         'secret': CONFIG.api_secret,
         'enableRateLimit': True,
         'options': {
             'defaultType': 'future',
             'sandBox': False,
-            'recvWindow': 10000,
-            'adjustForTimeDifference': True,
+            'recvWindow': 30000,
+            'adjustForTimeDifference': False,
             'keepAlive': False,
         },
         'timeout': 30000,
     })
-
-async def sync_exchange_time(exchange):
-    """Sync exchange time to prevent timestamp errors"""
-    try:
-        # Get Binance server time
-        server_time = await exchange.fetch_time()
-        local_time = exchange.milliseconds()
-        time_diff = server_time - local_time
-        
-        # Set time difference for future requests
-        exchange.options['timeDifference'] = time_diff
-        
-        logging.info(f"Time sync: Local={local_time}, Server={server_time}, Diff={time_diff}ms")
-        
-    except Exception as e:
-        logging.warning(f"Time sync failed: {e}")
+    
+    return exchange
 
 async def get_account_balance(exchange) -> float:
     """Get account balance with CCXT Pro priority"""
@@ -1348,6 +1682,28 @@ class MomentumDetector:
                 else:
                     return "ALLOW", f"Normal momentum: {change_24h:+.1f}% (24h), {change_1h:+.1f}% (1h), range: {daily_range:.1f}%", metrics
             
+            if mode == "ENHANCE_SIGNALS":
+                # Avoid recent extremes (reduces false signals)
+                if abs(change_1h) >= CONFIG.momentum.hourly_pump_threshold:
+                    return "AVOID", f"Recent extreme move: {change_1h:+.1f}% (1h)", metrics
+                
+                if abs(change_24h) >= CONFIG.momentum.daily_pump_threshold:
+                    return "AVOID", f"Daily extreme: {change_24h:+.1f}% (24h)", metrics
+                
+                # Require minimum volatility (ensures movement potential)
+                if daily_range < CONFIG.momentum.min_daily_volatility:
+                    return "AVOID", f"Low volatility: {daily_range:.1f}%", metrics
+                
+                # Avoid excessive volatility (reduces unpredictable moves)
+                if daily_range > CONFIG.momentum.max_daily_volatility:
+                    return "AVOID", f"Excessive volatility: {daily_range:.1f}%", metrics
+                
+                # Prefer volume spikes (indicates institutional activity)
+                if volume_spike > 1.5:
+                    return "ALLOW", f"Enhanced signal: Volume spike {volume_spike:.1f}x", metrics
+                
+                return "ALLOW", f"Normal conditions: {change_24h:+.1f}% (24h)", metrics
+
             return "ALLOW", "Default allow", metrics
             
         except Exception as e:
@@ -1484,196 +1840,100 @@ class Position:
     alert_sent: bool = False
 
 class PositionManager:
-    """Position manager with proper symbol handling"""
+    """Position manager with reliable tracking"""
     
     def __init__(self):
-        self.positions: Dict[str, Position] = {}  # Always use normalized symbols
+        self.positions: Dict[str, Position] = {}
         self.total_trades = 0
-        self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        self._position_locks: Dict[str, asyncio.Lock] = {}
         self.recent_attempts: Dict[str, float] = {}
         self.attempt_cooldown = 10
-        self._global_position_creation_lock = asyncio.Lock()
-
-        self._recent_closures: Dict[str, float] = {}
-        self._closure_grace_period = 3.0  # 3 seconds grace period
-
-        # Track position states to prevent false closures
-        self._position_states: Dict[str, Dict] = {}  # Track last known state
-        self._closure_confirmations: Dict[str, int] = {}  # Require multiple confirmations
-        self._required_confirmations = 3  # Need 3 consecutive checks to confirm closure
         
-        # Order monitoring
+        # Simplified monitoring
         self.order_monitoring_task: Optional[asyncio.Task] = None
         self.is_monitoring_orders = False
     
-    def get_symbol_lock(self, symbol: str) -> asyncio.Lock:
-        """Get or create symbol-specific lock"""
+    def get_position_lock(self, symbol: str) -> asyncio.Lock:
+        """Get lock for symbol"""
         normalized = normalize_symbol(symbol)
-        if normalized not in self._symbol_locks:
-            self._symbol_locks[normalized] = asyncio.Lock()
-        return self._symbol_locks[normalized]
+        if normalized not in self._position_locks:
+            self._position_locks[normalized] = asyncio.Lock()
+        return self._position_locks[normalized]
     
-    async def get_authoritative_positions(self, exchange) -> set:
-        """Enhanced position checking with fallback verification"""
-        global data_manager
-        
+    async def get_exchange_positions(self, exchange) -> set:
+        """Get actual positions from exchange - simplified"""
         try:
-            # Try CCXT Pro first
-            ccxt_positions = set()
-            if data_manager and data_manager.is_data_fresh('positions', max_age=15):
-                ccxt_positions = set(data_manager.get_positions().keys())
-                
-            # Always verify with REST API for accuracy
-            rest_positions = await exchange.fetch_positions()
-            rest_position_symbols = {
+            # Use REST API for reliability
+            positions = await exchange.fetch_positions()
+            active_symbols = {
                 normalize_symbol(p['symbol']) 
-                for p in rest_positions 
+                for p in positions 
                 if float(p.get('contracts', 0)) != 0
             }
             
-            # Use the union of both sources to avoid false negatives
-            all_positions = ccxt_positions | rest_position_symbols
-            
-            logging.debug(f"📊 CCXT: {ccxt_positions}, REST: {rest_position_symbols}, COMBINED: {all_positions}")
-            
-            return all_positions
+            logging.debug(f"Exchange positions: {active_symbols}")
+            return active_symbols
             
         except Exception as e:
-            logging.error(f"Failed to get authoritative positions: {e}")
-            return set(self.positions.keys())
+            logging.error(f"Failed to get exchange positions: {e}")
+            return set()
     
     async def start_order_monitoring(self, exchange):
-        """Less aggressive order monitoring"""
+        """Start simplified monitoring"""
         if not self.is_monitoring_orders:
             self.is_monitoring_orders = True
-            self.order_monitoring_task = asyncio.create_task(self._monitor_orders_and_positions(exchange))
-            logging.info("🔍 Order monitoring started")
+            self.order_monitoring_task = asyncio.create_task(self._monitor_positions(exchange))
+            logging.info("Position monitoring started")
     
     async def stop_order_monitoring(self):
-        """Enhanced stop monitoring"""
+        """Stop monitoring"""
         self.is_monitoring_orders = False
-        
-        if self.order_monitoring_task and not self.order_monitoring_task.done():
+        if self.order_monitoring_task:
             self.order_monitoring_task.cancel()
             try:
-                await asyncio.wait_for(self.order_monitoring_task, timeout=3.0)
+                await asyncio.wait_for(self.order_monitoring_task, timeout=2)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
-        
-        logging.info("🛑 Order monitoring stopped")
+        logging.info("Position monitoring stopped")
     
-    async def _monitor_orders_and_positions(self, exchange):
-        """Monitoring with closure confirmation system"""
-        
+    async def _monitor_positions(self, exchange):
+        """Simplified position monitoring"""
         while self.is_monitoring_orders:
             try:
-                current_positions = await self.get_authoritative_positions(exchange)
-                
-                # Update position states
-                for symbol in current_positions:
-                    self._position_states[symbol] = {
-                        'last_seen': time.time(),
-                        'status': 'active'
-                    }
-                    # Reset closure confirmation if position is active
-                    if symbol in self._closure_confirmations:
-                        self._closure_confirmations[symbol] = 0
-                
-                # Check for potential closures (positions we track but aren't in current_positions)
+                # Get actual positions every 10 seconds
+                exchange_positions = await self.get_exchange_positions(exchange)
                 tracked_positions = set(self.positions.keys())
-                potentially_closed = tracked_positions - current_positions
                 
-                for symbol in potentially_closed:
-                    # CRITICAL FIX: Require multiple confirmations before considering closed
-                    if symbol not in self._closure_confirmations:
-                        self._closure_confirmations[symbol] = 0
-                    
-                    self._closure_confirmations[symbol] += 1
-                    
-                    logging.debug(f"🔍 {symbol} potentially closed - confirmation {self._closure_confirmations[symbol]}/{self._required_confirmations}")
-                    
-                    # Only process closure after multiple confirmations
-                    if self._closure_confirmations[symbol] >= self._required_confirmations:
-                        logging.info(f"🗑️ Position {symbol} CONFIRMED closed after {self._required_confirmations} checks")
-                        
-                        # Add to recent closures tracking
-                        self._recent_closures[symbol] = time.time()
-                        
-                        # Clean up orders and handle closure
-                        await self.cleanup_all_orders_for_symbol(exchange, symbol)
-                        await self._handle_position_closure(exchange, symbol)
-                        
-                        # Clean up tracking
-                        del self._closure_confirmations[symbol]
-                        if symbol in self._position_states:
-                            del self._position_states[symbol]
+                # Find positions that were closed
+                closed_positions = tracked_positions - exchange_positions
                 
-                # Clean up old closure entries
-                current_time = time.time()
-                expired_closures = [
-                    symbol for symbol, closure_time in self._recent_closures.items()
-                    if current_time - closure_time > self._closure_grace_period * 2
-                ]
-                for symbol in expired_closures:
-                    del self._recent_closures[symbol]
+                for symbol in closed_positions:
+                    logging.info(f"Position closed detected: {symbol}")
+                    await self._handle_position_closure(exchange, symbol)
                 
-                # Clean up old confirmation entries for positions that are back
-                for symbol in list(self._closure_confirmations.keys()):
-                    if symbol in current_positions:
-                        del self._closure_confirmations[symbol]
-                
-                await asyncio.sleep(5)  # Check every 5 seconds
+                await asyncio.sleep(10)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logging.error(f"Order monitoring loop error: {e}")
-                await asyncio.sleep(10)
-    
-    async def cleanup_all_orders_for_symbol(self, exchange, symbol):
-        """Order cleanup with proper symbol conversion"""
-        normalized_symbol = normalize_symbol(symbol)
-        
-        try:
-            ccxt_symbol = to_ccxt_symbol(normalized_symbol)
-            logging.debug(f"🧹 Cleaning orders for {normalized_symbol} (CCXT: {ccxt_symbol})")
-            
-            open_orders = await exchange.fetch_open_orders(ccxt_symbol)
-            
-            cancelled = 0
-            for order in open_orders:
-                try:
-                    client_id = (order.get("clientOrderId") or 
-                               order.get("info", {}).get("clientOrderId") or "")
-                    
-                    # Only cancel our orders
-                    if client_id and any(client_id.startswith(prefix) for prefix in ['TP-0xLIQD', 'SL-0xLIQD']):
-                        await exchange.cancel_order(order['id'], ccxt_symbol)
-                        logging.info(f"✅ Cancelled order {order['id']} for {normalized_symbol}")
-                        cancelled += 1
-                        await asyncio.sleep(0.1)
-                        
-                except Exception as e:
-                    logging.warning(f"⚠️ Failed to cancel order {order.get('id', 'unknown')}: {e}")
-            
-            if cancelled > 0:
-                logging.info(f"🧹 Cleaned up {cancelled} orders for {normalized_symbol}")
-                
-        except Exception as e:
-            logging.warning(f"⚠️ Cleanup failed for {normalized_symbol}: {e}")
+                logging.error(f"Position monitoring error: {e}")
+                await asyncio.sleep(30)
     
     async def _handle_position_closure(self, exchange, symbol: str):
         """Handle position closure with P&L calculation"""
         try:
-            normalized_symbol = normalize_symbol(symbol)
-            
-            if normalized_symbol not in self.positions:
+            if symbol not in self.positions:
                 return
             
-            position = self.positions[normalized_symbol]
+            position = self.positions[symbol]
             
-            # Get exit price
-            exit_price = await self._get_exit_price(exchange, normalized_symbol)
+            # Get current price for P&L calculation
+            try:
+                ccxt_symbol = to_ccxt_symbol(symbol)
+                ticker = await exchange.fetch_ticker(ccxt_symbol)
+                exit_price = float(ticker['close'])
+            except:
+                exit_price = position.avg_entry_price
             
             # Calculate P&L
             if position.side == "buy":
@@ -1683,162 +1943,91 @@ class PositionManager:
             
             pnl_usd = position.total_notional_used * pnl_pct
             
-            # Determine action
-            action = self._determine_exit_action(position, exit_price)
-            
             # Send Discord notification
             if discord_notifier:
                 await discord_notifier.send_profit_alert(
-                    normalized_symbol, pnl_pct * 100, pnl_usd, action, exit_price
+                    symbol, pnl_pct * 100, pnl_usd, "POSITION CLOSED", exit_price
                 )
             
             # Remove position
-            del self.positions[normalized_symbol]
+            del self.positions[symbol]
             
-            logging.info(f"💰 Position closed: {normalized_symbol} | "
-                        f"P&L: {pnl_pct*100:+.2f}% (${pnl_usd:+.2f}) | "
-                        f"Entry: {position.avg_entry_price:.6f} | "
-                        f"Exit: {exit_price:.6f}")
-                        
+            logging.info(f"Position closed: {symbol} | P&L: {pnl_pct*100:+.2f}% (${pnl_usd:+.2f})")
+            
         except Exception as e:
-            logging.error(f"⚠️ Failed to handle position closure for {symbol}: {e}")
-    
-    async def _get_exit_price(self, exchange, symbol: str) -> float:
-        """Get exit price with multiple fallbacks"""
-        global data_manager
-        
-        normalized_symbol = normalize_symbol(symbol)
-        
-        # Try CCXT Pro price first
-        if data_manager:
-            price = data_manager.get_price(normalized_symbol)
-            if price > 0:
-                return price
-        
-        # Fallback to REST API
-        try:
-            ccxt_symbol = to_ccxt_symbol(normalized_symbol)
-            ticker = await exchange.fetch_ticker(ccxt_symbol)
-            return float(ticker['close'])
-        except:
-            # Use position entry price as absolute fallback
-            position = self.positions.get(normalized_symbol)
-            return position.avg_entry_price if position else 0
-    
-    def _determine_exit_action(self, position: Position, exit_price: float) -> str:
-        """Determine what caused the position exit"""
-        if position.side == "buy":
-            if exit_price >= position.avg_entry_price * (1 + CONFIG.profit_protection.initial_tp_pct * 0.9):
-                return "TAKE PROFIT"
-            elif CONFIG.profit_protection.enable_stop_loss and exit_price <= position.avg_entry_price * (1 - CONFIG.profit_protection.stop_loss_pct * 1.1):
-                return "STOP LOSS"
-        else:
-            if exit_price <= position.avg_entry_price * (1 - CONFIG.profit_protection.initial_tp_pct * 0.9):
-                return "TAKE PROFIT"
-            elif CONFIG.profit_protection.enable_stop_loss and exit_price >= position.avg_entry_price * (1 + CONFIG.profit_protection.stop_loss_pct * 1.1):
-                return "STOP LOSS"
-        
-        return "POSITION CLOSED"
+            logging.error(f"Failed to handle position closure for {symbol}: {e}")
     
     async def create_position(self, exchange, symbol: str, side: str, liq_price: float,
-                         liq_size: float, vwap_ref: float, regime: str,
-                         balance: float) -> Optional[Position]:
-        """Enhanced position creation with better verification"""
+                             liq_size: float, vwap_ref: float, regime: str, balance: float) -> Optional[Position]:
+        """Simplified position creation"""
         
         normalized_symbol = normalize_symbol(symbol)
-        symbol_lock = self.get_symbol_lock(normalized_symbol)
+        position_lock = self.get_position_lock(normalized_symbol)
         
-        async with symbol_lock:
-            async with self._global_position_creation_lock:
-                
-                # Check if recently closed
-                current_time = time.time()
-                if normalized_symbol in self._recent_closures:
-                    time_since_closure = current_time - self._recent_closures[normalized_symbol]
-                    if time_since_closure < self._closure_grace_period:
-                        logging.info(f"⚠️ {normalized_symbol}: Recently closed {time_since_closure:.1f}s ago, skipping")
-                        return None
-                
-                # Enhanced position checking with multiple attempts
-                max_attempts = 3
-                for attempt in range(max_attempts):
-                    authoritative_positions = await self.get_authoritative_positions(exchange)
-                    
-                    logging.info(f"🔍 Position check attempt {attempt + 1}: {len(authoritative_positions)} active positions")
-                    logging.info(f"🔍 Active positions: {authoritative_positions}")
-                    
-                    # STRICT max position enforcement
-                    if len(authoritative_positions) >= CONFIG.risk.max_positions:
-                        logging.warning(f"⚠️ MAX POSITIONS REACHED: {len(authoritative_positions)}/{CONFIG.risk.max_positions}")
-                        stats.log_filter_rejection("max_positions")
-                        return None
-                    
-                    # Check if position already exists
-                    if normalized_symbol in authoritative_positions:
-                        logging.info(f"⚠️ Position already exists: {normalized_symbol}")
-                        stats.log_filter_rejection("existing_position")
-                        return None
-                    
-                    # If checks pass, proceed
-                    break
-                    
-                    # Brief delay before retry
-                    if attempt < max_attempts - 1:
-                        await asyncio.sleep(0.5)
-                
-                # Rate limiting
-                last_attempt = self.recent_attempts.get(normalized_symbol, 0)
-                if current_time - last_attempt < self.attempt_cooldown:
-                    logging.info(f"⚠️ {normalized_symbol}: Cooldown active")
-                    return None
-                self.recent_attempts[normalized_symbol] = current_time
-                
-                # Isolation check
-                total_notional_used = sum(p.total_notional_used for p in self.positions.values())
-                isolation_limit = balance * CONFIG.risk.isolation_pct * CONFIG.leverage
-                if total_notional_used + CONFIG.min_notional > isolation_limit:
-                    logging.info(f"⚠️ {normalized_symbol}: Isolation limit reached")
-                    stats.log_filter_rejection('isolation_limit')
-                    return None
-                
-                # Get pair config
-                pair_config = pairs_builder.get_pair_config(normalized_symbol)
-                if not pair_config:
-                    logging.error(f"⚠️ {normalized_symbol}: No pair config found")
-                    return None
-                
-                # Calculate position size
-                entry_notional = CONFIG.min_notional
-                entry_qty = entry_notional / liq_price
-                
-                # Apply quantity rounding
-                step_size = pair_config.get('step_size', 0.001)
-                entry_qty = round(entry_qty / step_size) * step_size
-                actual_notional = entry_qty * liq_price
-                
-                # Create position object
-                position = Position(
-                    symbol=normalized_symbol,
-                    side=side,
-                    total_qty=entry_qty,
-                    avg_entry_price=liq_price,
-                    total_notional_used=actual_notional,
-                    vwap_reference=vwap_ref,
-                    regime=regime
-                )
-                
-                self.positions[normalized_symbol] = position
-                self.total_trades += 1
-                
-                # Initialize position state tracking
-                self._position_states[normalized_symbol] = {
-                    'last_seen': current_time,
-                    'status': 'active'
-                }
-                
-                logging.info(f"✅ Position created: {normalized_symbol} {side} {entry_qty:.6f} @ {liq_price:.6f}")
-                
-                return position
+        async with position_lock:
+            current_time = time.time()
+            
+            # Rate limiting
+            last_attempt = self.recent_attempts.get(normalized_symbol, 0)
+            if current_time - last_attempt < self.attempt_cooldown:
+                logging.info(f"Cooldown active for {normalized_symbol}")
+                return None
+            
+            # Get current positions from exchange
+            exchange_positions = await self.get_exchange_positions(exchange)
+            
+            # Check max positions limit
+            if len(exchange_positions) >= CONFIG.risk.max_positions:
+                logging.warning(f"MAX POSITIONS REACHED: {len(exchange_positions)}/{CONFIG.risk.max_positions}")
+                stats.log_filter_rejection("max_positions")
+                return None
+            
+            # Check if position already exists
+            if normalized_symbol in exchange_positions:
+                logging.info(f"Position already exists: {normalized_symbol}")
+                stats.log_filter_rejection("existing_position")
+                return None
+            
+            # Isolation check
+            total_notional_used = sum(p.total_notional_used for p in self.positions.values())
+            isolation_limit = balance * CONFIG.risk.isolation_pct * CONFIG.leverage
+            if total_notional_used + CONFIG.min_notional > isolation_limit:
+                logging.info(f"Isolation limit reached for {normalized_symbol}")
+                stats.log_filter_rejection('isolation_limit')
+                return None
+            
+            # Get pair config
+            pair_config = pairs_builder.get_pair_config(normalized_symbol)
+            if not pair_config:
+                logging.error(f"No pair config for {normalized_symbol}")
+                return None
+            
+            # Calculate position size
+            entry_notional = CONFIG.min_notional
+            entry_qty = entry_notional / liq_price
+            
+            # Apply quantity rounding
+            step_size = pair_config.get('step_size', 0.001)
+            entry_qty = round(entry_qty / step_size) * step_size
+            actual_notional = entry_qty * liq_price
+            
+            # Create position object
+            position = Position(
+                symbol=normalized_symbol,
+                side=side,
+                total_qty=entry_qty,
+                avg_entry_price=liq_price,
+                total_notional_used=actual_notional,
+                vwap_reference=vwap_ref,
+                regime=regime
+            )
+            
+            self.positions[normalized_symbol] = position
+            self.total_trades += 1
+            self.recent_attempts[normalized_symbol] = current_time
+            
+            logging.info(f"Position created: {normalized_symbol} {side} {entry_qty:.6f} @ {liq_price:.6f}")
+            return position
     
     async def check_dca_trigger(self, symbol: str, current_price: float) -> Tuple[bool, int]:
         """Check if DCA should be triggered"""
@@ -1849,41 +2038,36 @@ class PositionManager:
         
         position = self.positions[normalized_symbol]
         
-        # Check limits
         if position.dca_count >= CONFIG.dca.max_levels:
             return False, -1
         
-        # Calculate adverse move percentage
+        # Calculate adverse move
         if position.side == "buy":
             adverse_move = (position.avg_entry_price - current_price) / position.avg_entry_price
         else:
             adverse_move = (current_price - position.avg_entry_price) / position.avg_entry_price
         
         # Check trigger
-        next_level = position.dca_count
-        if next_level < len(CONFIG.dca.trigger_pcts):
-            trigger_threshold = CONFIG.dca.trigger_pcts[next_level]
+        if position.dca_count < len(CONFIG.dca.trigger_pcts):
+            trigger_threshold = CONFIG.dca.trigger_pcts[position.dca_count]
             if adverse_move >= trigger_threshold:
-                return True, next_level + 1
+                return True, position.dca_count + 1
         
         return False, -1
     
-    async def execute_dca(self, exchange, symbol: str, current_price: float,
-                         dca_level: int) -> bool:
-        """Execute DCA with enhanced order management"""
+    async def execute_dca(self, exchange, symbol: str, current_price: float, dca_level: int) -> bool:
+        """Execute DCA"""
         normalized_symbol = normalize_symbol(symbol)
-        symbol_lock = self.get_symbol_lock(normalized_symbol)
+        position_lock = self.get_position_lock(normalized_symbol)
         
-        async with symbol_lock:
+        async with position_lock:
             if normalized_symbol not in self.positions:
                 return False
             
             position = self.positions[normalized_symbol]
-            
-            # Get pair config
             pair_config = pairs_builder.get_pair_config(normalized_symbol)
+            
             if not pair_config:
-                logging.error(f"⚠️ DCA failed: No pair config for {normalized_symbol}")
                 return False
             
             # Calculate DCA size
@@ -1898,16 +2082,6 @@ class PositionManager:
             step_size = pair_config.get('step_size', 0.001)
             dca_qty = round(dca_qty / step_size) * step_size
             actual_notional = dca_qty * current_price
-            
-            # Isolation check
-            total_notional_used = sum(p.total_notional_used for p in self.positions.values())
-            balance = await get_account_balance(exchange)
-            isolation_limit = balance * CONFIG.risk.isolation_pct * CONFIG.leverage
-            
-            if total_notional_used + actual_notional > isolation_limit:
-                logging.info(f"⚠️ DCA L{dca_level} {normalized_symbol}: Would exceed isolation limit")
-                stats.log_dca_attempt(False)
-                return False
             
             try:
                 # Execute DCA order
@@ -1929,14 +2103,13 @@ class PositionManager:
                 position.dca_count += 1
                 position.total_notional_used += actual_notional
                 
-                logging.info(f"✅ DCA L{dca_level}: {normalized_symbol} {dca_qty:.6f} @ {actual_price:.6f} | "
-                           f"Multiplier: {size_multiplier}x | New Avg: {new_avg_price:.6f}")
+                logging.info(f"DCA L{dca_level}: {normalized_symbol} @ {actual_price:.6f}")
                 
                 # Send Discord notification
                 if discord_notifier:
                     await discord_notifier.send_trade_alert(
                         normalized_symbol, position.side, dca_qty, actual_price,
-                        f"DCA Level {dca_level} (${CONFIG.min_notional} × {size_multiplier}x)", actual_notional,
+                        f"DCA Level {dca_level}", actual_notional,
                         is_dca=True, dca_level=dca_level
                     )
                 
@@ -1944,33 +2117,20 @@ class PositionManager:
                 return True
                 
             except Exception as e:
-                logging.error(f"⚠️ DCA execution failed for {normalized_symbol} L{dca_level}: {e}")
+                logging.error(f"DCA execution failed for {normalized_symbol}: {e}")
                 stats.log_dca_attempt(False)
                 return False
     
     def get_position_count(self) -> int:
-        """Get count of local positions"""
         return len(self.positions)
     
-    async def get_total_position_count(self, exchange) -> int:
-        """Get accurate count from authoritative source"""
-        authoritative_positions = await self.get_authoritative_positions(exchange)
-        return len(authoritative_positions)
-    
     def has_position(self, symbol: str) -> bool:
-        normalized_symbol = normalize_symbol(symbol)
-        return normalized_symbol in self.positions
+        return normalize_symbol(symbol) in self.positions
     
     def remove_position(self, symbol: str):
-        normalized_symbol = normalize_symbol(symbol)
-        if normalized_symbol in self.positions:
-            del self.positions[normalized_symbol]
-            
-        # Clean up tracking data
-        if normalized_symbol in self._position_states:
-            del self._position_states[normalized_symbol]
-        if normalized_symbol in self._closure_confirmations:
-            del self._closure_confirmations[normalized_symbol]
+        normalized = normalize_symbol(symbol)
+        if normalized in self.positions:
+            del self.positions[normalized]
 
 position_manager = PositionManager()
 
@@ -1979,120 +2139,209 @@ position_manager = PositionManager()
 # =============================================================================
 
 class ProfitProtectionSystem:
-    """Profit protection with proper order management"""
+    """Profit protection with separate TP/SL orders and monitoring"""
     
     def __init__(self):
-        self.protection_cache: Dict[str, Dict] = {}
         self.order_registry: Dict[str, Dict] = {}
+        self.monitoring_task: Optional[asyncio.Task] = None
+        self.is_monitoring = False
     
     async def set_initial_take_profit(self, exchange, position: Position) -> bool:
-        """Set initial take profit"""
+        """Set separate TP and SL orders with monitoring"""
         try:
             normalized_symbol = normalize_symbol(position.symbol)
             
-            # Calculate TP price
+            # Calculate prices
             if position.side == "buy":
                 tp_price = position.avg_entry_price * (1 + CONFIG.profit_protection.initial_tp_pct)
-                sl_price = position.avg_entry_price * (1 - CONFIG.profit_protection.stop_loss_pct) if CONFIG.profit_protection.enable_stop_loss else 0
+                sl_price = position.avg_entry_price * (1 - CONFIG.profit_protection.stop_loss_pct) if CONFIG.profit_protection.enable_stop_loss else None
             else:
                 tp_price = position.avg_entry_price * (1 - CONFIG.profit_protection.initial_tp_pct)
-                sl_price = position.avg_entry_price * (1 + CONFIG.profit_protection.stop_loss_pct) if CONFIG.profit_protection.enable_stop_loss else 0
-
-            position.tp_price = tp_price
-
-            # Create unique but identifiable client IDs
+                sl_price = position.avg_entry_price * (1 + CONFIG.profit_protection.stop_loss_pct) if CONFIG.profit_protection.enable_stop_loss else None
+            
+            ccxt_symbol = to_ccxt_symbol(normalized_symbol)
+            exit_side = "sell" if position.side == "buy" else "buy"
+            
+            # Create unique client IDs for tracking
             timestamp = int(time.time() * 1000)
             tp_client_id = f"TP-0xLIQD-{normalized_symbol}-{timestamp}"
-            sl_client_id = f"SL-0xLIQD-{normalized_symbol}-{timestamp}"
-
-            # Place TP order
-            tp_side = "sell" if position.side == "buy" else "buy"
-            ccxt_symbol = to_ccxt_symbol(normalized_symbol)
-
+            sl_client_id = f"SL-0xLIQD-{normalized_symbol}-{timestamp}" if sl_price else None
+            
+            # 1. Create Take Profit Order
             tp_order = await exchange.create_limit_order(
-                ccxt_symbol, tp_side, position.total_qty, tp_price,
+                ccxt_symbol, exit_side, position.total_qty, tp_price,
                 params={
                     "positionSide": "LONG" if position.side == "buy" else "SHORT",
                     "newClientOrderId": tp_client_id,
                     "timeInForce": "GTC"
                 }
             )
-
-            # Store order tracking info
-            position.tp_client_id = tp_client_id
-            position.tp_order_id = str(tp_order.get('id', ''))
             
-            self.order_registry[normalized_symbol] = {
-                'tp_client_id': tp_client_id,
-                'tp_order_id': position.tp_order_id,
-                'timestamp': timestamp
-            }
-
-            logging.info(f"✅ TP set: {normalized_symbol} @ {tp_price:.6f} ({CONFIG.profit_protection.initial_tp_pct*100:.1f}%)")
-
-            # Place SL order if enabled
-            if CONFIG.profit_protection.enable_stop_loss and sl_price > 0:
+            position.tp_price = tp_price
+            position.tp_order_id = str(tp_order.get('id', ''))
+            position.tp_client_id = tp_client_id
+            
+            logging.info(f"TP set: {normalized_symbol} @ {tp_price:.6f}")
+            
+            # 2. Create Stop Loss Order (if enabled)
+            if CONFIG.profit_protection.enable_stop_loss and sl_price:
                 try:
-                    sl_side = "sell" if position.side == "buy" else "buy"
                     sl_order = await exchange.create_order(
                         ccxt_symbol,
                         'STOP_MARKET',
-                        sl_side,
+                        exit_side,
                         position.total_qty,
-                        None,
+                        None,  # No limit price for market stop
                         params={
                             "stopPrice": sl_price,
                             "positionSide": "LONG" if position.side == "buy" else "SHORT",
-                            "newClientOrderId": sl_client_id
+                            "newClientOrderId": sl_client_id,
+                            "timeInForce": "GTC"
                         }
                     )
                     
                     position.sl_price = sl_price
-                    position.sl_client_id = sl_client_id
                     position.sl_order_id = str(sl_order.get('id', ''))
+                    position.sl_client_id = sl_client_id
                     
-                    self.order_registry[normalized_symbol].update({
-                        'sl_client_id': sl_client_id,
-                        'sl_order_id': position.sl_order_id
-                    })
-                    
-                    logging.info(f"✅ SL set: {normalized_symbol} @ {sl_price:.6f}")
+                    logging.info(f"SL set: {normalized_symbol} @ {sl_price:.6f}")
                     
                 except Exception as sl_error:
-                    logging.warning(f"⚠️ Stop loss setup failed for {normalized_symbol}: {sl_error}")
-
+                    logging.warning(f"Stop loss setup failed for {normalized_symbol}: {sl_error}")
+            
+            # Store order information for monitoring
+            self.order_registry[normalized_symbol] = {
+                'tp_order_id': position.tp_order_id,
+                'sl_order_id': getattr(position, 'sl_order_id', None),
+                'tp_client_id': tp_client_id,
+                'sl_client_id': sl_client_id,
+                'position_side': position.side,
+                'symbol': ccxt_symbol
+            }
+            
+            # Start monitoring if not already running
+            if not self.is_monitoring:
+                await self.start_order_monitoring(exchange)
+            
             return True
-
+            
         except Exception as e:
-            logging.error(f"⚠️ TP setup failed {position.symbol}: {e}")
+            logging.error(f"Order setup failed for {position.symbol}: {e}")
             return False
     
+    async def start_order_monitoring(self, exchange):
+        """Start monitoring for filled orders"""
+        if self.is_monitoring:
+            return
+            
+        self.is_monitoring = True
+        self.monitoring_task = asyncio.create_task(self._monitor_order_fills(exchange))
+        logging.info("Order monitoring started")
+    
+    async def stop_order_monitoring(self):
+        """Stop order monitoring"""
+        self.is_monitoring = False
+        if self.monitoring_task:
+            self.monitoring_task.cancel()
+            try:
+                await asyncio.wait_for(self.monitoring_task, timeout=2)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        logging.info("Order monitoring stopped")
+    
+    async def _monitor_order_fills(self, exchange):
+        """Monitor for filled TP/SL orders and cancel counterparts"""
+        while self.is_monitoring:
+            try:
+                # Check each symbol's orders
+                for symbol, order_info in list(self.order_registry.items()):
+                    try:
+                        ccxt_symbol = order_info['symbol']
+                        tp_order_id = order_info.get('tp_order_id')
+                        sl_order_id = order_info.get('sl_order_id')
+                        
+                        # Check TP order status
+                        if tp_order_id:
+                            try:
+                                tp_status = await exchange.fetch_order(tp_order_id, ccxt_symbol)
+                                if tp_status['status'] in ['closed', 'filled']:
+                                    logging.info(f"TP filled for {symbol}, cancelling SL")
+                                    
+                                    # Cancel SL order
+                                    if sl_order_id:
+                                        try:
+                                            await exchange.cancel_order(sl_order_id, ccxt_symbol)
+                                            logging.info(f"SL cancelled for {symbol}")
+                                        except Exception as cancel_error:
+                                            logging.debug(f"SL cancel failed (might be filled): {cancel_error}")
+                                    
+                                    # Remove from monitoring
+                                    del self.order_registry[symbol]
+                                    continue
+                                    
+                            except Exception as tp_error:
+                                # Order might not exist anymore
+                                logging.debug(f"TP check failed for {symbol}: {tp_error}")
+                        
+                        # Check SL order status
+                        if sl_order_id:
+                            try:
+                                sl_status = await exchange.fetch_order(sl_order_id, ccxt_symbol)
+                                if sl_status['status'] in ['closed', 'filled']:
+                                    logging.info(f"SL filled for {symbol}, cancelling TP")
+                                    
+                                    # Cancel TP order
+                                    if tp_order_id:
+                                        try:
+                                            await exchange.cancel_order(tp_order_id, ccxt_symbol)
+                                            logging.info(f"TP cancelled for {symbol}")
+                                        except Exception as cancel_error:
+                                            logging.debug(f"TP cancel failed (might be filled): {cancel_error}")
+                                    
+                                    # Remove from monitoring
+                                    del self.order_registry[symbol]
+                                    continue
+                                    
+                            except Exception as sl_error:
+                                # Order might not exist anymore
+                                logging.debug(f"SL check failed for {symbol}: {sl_error}")
+                        
+                    except Exception as symbol_error:
+                        logging.debug(f"Order monitoring error for {symbol}: {symbol_error}")
+                        continue
+                
+                await asyncio.sleep(3)  # Check every 3 seconds
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Order monitoring loop error: {e}")
+                await asyncio.sleep(10)
+    
     async def update_orders_after_dca(self, exchange, position: Position) -> bool:
-        """Update TP/SL orders after DCA execution"""
+        """Update orders after DCA"""
         try:
             normalized_symbol = normalize_symbol(position.symbol)
-            
-            # Cancel existing orders first
             ccxt_symbol = to_ccxt_symbol(normalized_symbol)
-            orders = await exchange.fetch_open_orders(ccxt_symbol)
-
-            for order in orders:
-                client_id = order.get("clientOrderId") or order.get("info", {}).get("clientOrderId") or order.get("info", {}).get("newClientOrderId")
-                platform_id = order.get("id")
-                
-                # Only cancel our specific orders
-                if (getattr(position, "tp_client_id", None) and client_id == position.tp_client_id) or \
-                   (getattr(position, "tp_order_id", None) and platform_id == position.tp_order_id):
-                    try:
-                        await exchange.cancel_order(platform_id, ccxt_symbol)
-                        logging.debug(f"Cancelled TP order {platform_id} for DCA update")
-                    except Exception as e:
-                        if '-2011' in str(e) or 'Unknown order' in str(e):
-                            logging.debug(f"Ignored unknown order {platform_id}")
-                        else:
-                            logging.warning(f"Failed to cancel order {platform_id}: {e}")
             
-            # Set new orders with updated position size
+            # Cancel existing orders
+            if hasattr(position, 'tp_order_id') and position.tp_order_id:
+                try:
+                    await exchange.cancel_order(position.tp_order_id, ccxt_symbol)
+                except:
+                    pass
+            
+            if hasattr(position, 'sl_order_id') and position.sl_order_id:
+                try:
+                    await exchange.cancel_order(position.sl_order_id, ccxt_symbol)
+                except:
+                    pass
+            
+            # Remove from monitoring registry
+            if normalized_symbol in self.order_registry:
+                del self.order_registry[normalized_symbol]
+            
+            # Create new orders with updated position
             return await self.set_initial_take_profit(exchange, position)
             
         except Exception as e:
@@ -2106,7 +2355,7 @@ profit_protection = ProfitProtectionSystem()
 # =============================================================================
 
 class VWAPHunterStrategy:
-    """Enhanced VWAP Hunter with CCXT Pro integration"""
+    """Simplified VWAP Hunter strategy"""
     
     def __init__(self, exchange):
         self.exchange = exchange
@@ -2114,35 +2363,28 @@ class VWAPHunterStrategy:
         self.last_price_update: Dict[str, float] = {}
         self.entry_timestamps: Dict[str, float] = {}
         
-        # Add momentum detector
+        # Only create momentum detector if data manager exists
         global data_manager
-        if data_manager:
-            self.momentum_detector = MomentumDetector(data_manager)
-        else:
-            self.momentum_detector = None
+        self.momentum_detector = MomentumDetector(data_manager) if data_manager else None
     
     async def get_current_price(self, symbol: str) -> float:
-        """Get current price with CCXT Pro priority"""
-        global data_manager
-        
+        """Optimized price fetching"""
         normalized_symbol = normalize_symbol(symbol)
         
-        # Try CCXT Pro first
+        # Check cache first (5 second validity)
+        current_time = time.time()
+        if (normalized_symbol in self.price_cache and 
+            current_time - self.last_price_update.get(normalized_symbol, 0) < 5):
+            return self.price_cache[normalized_symbol]
+        
+        # Try CCXT Pro
+        global data_manager
         if data_manager:
             price = data_manager.get_price(normalized_symbol)
             if price > 0:
                 self.price_cache[normalized_symbol] = price
-                self.last_price_update[normalized_symbol] = time.time()
+                self.last_price_update[normalized_symbol] = current_time
                 return price
-            
-            # Subscribe to symbol if not already subscribed
-            data_manager.subscribe_symbol(normalized_symbol)
-        
-        # Fallback to cached price or REST API
-        current_time = time.time()
-        if (normalized_symbol in self.price_cache and
-            current_time - self.last_price_update.get(normalized_symbol, 0) < 60):
-            return self.price_cache[normalized_symbol]
         
         # REST API fallback
         try:
@@ -2151,51 +2393,26 @@ class VWAPHunterStrategy:
             price = float(ticker['close'])
             self.price_cache[normalized_symbol] = price
             self.last_price_update[normalized_symbol] = current_time
-            logging.debug(f"Price from REST API: {normalized_symbol} = {price}")
             return price
-        except Exception as e:
-            if CONFIG.debug.enable_data_debug:
-                logging.warning(f"Price fetch failed for {normalized_symbol}: {e}")
+        except:
             return self.price_cache.get(normalized_symbol, 0)
     
     async def check_volume_filter(self, symbol: str) -> Tuple[bool, float]:
-        """Check volume with CCXT Pro priority"""
-        global data_manager
-        
+        """Check volume - simplified"""
         normalized_symbol = normalize_symbol(symbol)
         
-        # Try CCXT Pro first
-        if data_manager:
-            daily_volume = data_manager.get_volume_24h(normalized_symbol)
-            if daily_volume > 0:
-                passed = daily_volume >= CONFIG.risk.min_24h_volume
-                if CONFIG.debug.enable_filter_debug:
-                    debug_logger = logging.getLogger('trade_debug')
-                    debug_logger.debug(f"Volume filter {normalized_symbol}: ${daily_volume:,.0f} ({'PASS' if passed else 'FAIL'})")
-                return passed, daily_volume
-            
-            # Subscribe to symbol for future updates
-            data_manager.subscribe_symbol(normalized_symbol)
-        
-        # Fallback to REST API
         try:
             ccxt_symbol = to_ccxt_symbol(normalized_symbol)
             ticker = await self.exchange.fetch_ticker(ccxt_symbol)
             daily_volume = float(ticker.get("quoteVolume", 0))
             passed = daily_volume >= CONFIG.risk.min_24h_volume
-            
-            if CONFIG.debug.enable_filter_debug:
-                debug_logger = logging.getLogger('trade_debug')
-                debug_logger.debug(f"Volume filter {normalized_symbol}: ${daily_volume:,.0f} ({'PASS' if passed else 'FAIL'})")
-            
             return passed, daily_volume
         except Exception as e:
-            if CONFIG.debug.enable_data_debug:
-                logging.warning(f"Volume check failed for {normalized_symbol}: {e}")
+            logging.warning(f"Volume check failed for {normalized_symbol}: {e}")
             return False, 0
     
     async def process_liquidation_event(self, liquidation_data: Dict):
-        """Process liquidation event with comprehensive filtering"""
+        """Process liquidation event - simplified"""
         start_time = time.time()
         
         try:
@@ -2205,9 +2422,7 @@ class VWAPHunterStrategy:
             if not symbol or not symbol.endswith('USDT'):
                 return
             
-            # Normalize symbol immediately
             normalized_symbol = normalize_symbol(symbol)
-            
             liq_price = float(data.get('ap', 0))
             liq_qty = float(data.get('q', 0))
             liq_side = data.get('S', '')
@@ -2218,214 +2433,134 @@ class VWAPHunterStrategy:
             liq_size_usd = liq_price * liq_qty
             our_side = "buy" if liq_side == "SELL" else "sell"
             
-            # Ensure CCXT Pro subscription
-            global data_manager
-            if data_manager:
-                data_manager.subscribe_symbol(normalized_symbol)
-            
-            # Log all liquidations if enabled
+            # Log liquidation
             if CONFIG.debug.log_all_liquidations:
-                logging.info(f"📡 LIQUIDATION: {normalized_symbol} | {liq_side} | {liq_qty:.4f} @ {liq_price:.6f} | ${liq_size_usd:,.0f}")
+                logging.info(f"LIQUIDATION: {normalized_symbol} | {liq_side} | ${liq_size_usd:,.0f}")
             
-            # Update statistics
             stats.log_liquidation(normalized_symbol, liq_size_usd)
             
-            # Entry cooldown check
-            cooldown = 30
+            # Entry cooldown
             last = self.entry_timestamps.get(normalized_symbol, 0)
-            if time.time() - last < cooldown:
-                if CONFIG.debug.enable_filter_debug:
-                    logging.info(f"⚠️ {normalized_symbol}: Entry cooldown active ({time.time()-last:.0f}s elapsed)")
+            if time.time() - last < 30:
                 return
             
-            # Enhanced filter debugging
-            if CONFIG.debug.enable_trade_debug:
-                debug_logger = logging.getLogger('trade_debug')
-                debug_logger.debug(f"🔍 ANALYZING: {normalized_symbol} | Liq: {liq_side} @ {liq_price:.6f} | Our Side: {our_side}")
-            
-            # Filter 1: Pair enabled check
+            # Filter checks
             if not pairs_builder.is_pair_enabled(normalized_symbol):
                 stats.log_filter_rejection('pair_not_enabled')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.info(f"⚠️ {normalized_symbol}: Pair not enabled")
                 return
             
-            # Filter 2: Enhanced volume check
             volume_pass, daily_volume = await self.check_volume_filter(normalized_symbol)
             if not volume_pass:
                 stats.log_filter_rejection('volume_filter')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.info(f"⚠️ {normalized_symbol}: Volume too low (${daily_volume:,.0f} < ${CONFIG.risk.min_24h_volume:,.0f})")
                 return
             
-            # Filter 3: Enhanced momentum filter
+            # Momentum filter
             if CONFIG.momentum.enable_momentum_filter and self.momentum_detector:
-                if data_manager:
-                    data_manager.subscribe_symbol(normalized_symbol)
-                    await asyncio.sleep(0.1)
-                
-                momentum_signal, momentum_reason, momentum_metrics = self.momentum_detector.get_momentum_signal(normalized_symbol)
-                
-                if momentum_signal == "AVOID":
+                signal, reason, _ = self.momentum_detector.get_momentum_signal(normalized_symbol)
+                if signal == "AVOID":
                     stats.log_filter_rejection('momentum_filter')
-                    if CONFIG.debug.enable_filter_debug:
-                        logging.info(f"⚠️ {normalized_symbol}: Momentum filter - {momentum_reason}")
                     return
-                
-                if CONFIG.debug.enable_trade_debug:
-                    debug_logger = logging.getLogger('trade_debug')
-                    debug_logger.debug(f"📈 MOMENTUM {normalized_symbol}: {momentum_reason}")
             
-            # Filter 4: Zones data check
+            # Zones check
             if not rapidapi_client.has_zones(normalized_symbol):
                 stats.log_filter_rejection('no_zones')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.info(f"⚠️ {normalized_symbol}: No price zones data")
                 return
             
-            # Filter 5: Data age check
-            data_age = rapidapi_client.get_data_age_minutes()
-            if data_age > 60:
-                stats.log_filter_rejection('old_data')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.warning(f"⚠️ {normalized_symbol}: Price zones data is {data_age:.0f} minutes old")
-            
-            # Get pair config
-            pair_config = pairs_builder.get_pair_config(normalized_symbol)
-            if not pair_config:
-                if CONFIG.debug.enable_filter_debug:
-                    logging.error(f"⚠️ {normalized_symbol}: No pair config found")
-                return
-            
-            # VWAP level analysis
-            if CONFIG.vwap.vwap_enhancement:
-                await vwap_calculator.calculate_realtime_vwap(self.exchange, normalized_symbol)
-            
+            # VWAP levels
             long_level, short_level, vwap_ref = vwap_calculator.get_vwap_levels(normalized_symbol, liq_price)
             
             if long_level <= 0 or short_level <= 0:
                 stats.log_filter_rejection('invalid_vwap')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.info(f"⚠️ {normalized_symbol}: Invalid VWAP levels (L:{long_level:.6f} S:{short_level:.6f})")
                 return
             
-            # Entry signal analysis
+            # Entry signal
             entry_valid = False
             entry_reason = ""
             
-            if our_side == "buy":
-                if liq_price <= long_level:
-                    entry_valid = True
-                    entry_reason = f"LONG: {liq_price:.6f} ≤ {long_level:.6f} (Zone hit)"
-                else:
-                    zone_distance = ((liq_price - long_level) / long_level) * 100
-                    entry_reason = f"LONG: {liq_price:.6f} > {long_level:.6f} (Above zone by {zone_distance:.2f}%)"
-            elif our_side == "sell":
-                if liq_price >= short_level:
-                    entry_valid = True
-                    entry_reason = f"SHORT: {liq_price:.6f} ≥ {short_level:.6f} (Zone hit)"
-                else:
-                    zone_distance = ((short_level - liq_price) / short_level) * 100
-                    entry_reason = f"SHORT: {liq_price:.6f} < {short_level:.6f} (Below zone by {zone_distance:.2f}%)"
-            
-            if CONFIG.debug.enable_trade_debug:
-                debug_logger = logging.getLogger('trade_debug')
-                debug_logger.debug(f"📊 ZONES {normalized_symbol}: Long={long_level:.6f} Short={short_level:.6f} VWAP={vwap_ref:.6f}")
-                debug_logger.debug(f"🎯 SIGNAL {normalized_symbol}: {entry_reason}")
+            if our_side == "buy" and liq_price <= long_level:
+                entry_valid = True
+                entry_reason = f"LONG: {liq_price:.6f} <= {long_level:.6f}"
+            elif our_side == "sell" and liq_price >= short_level:
+                entry_valid = True
+                entry_reason = f"SHORT: {liq_price:.6f} >= {short_level:.6f}"
             
             if not entry_valid:
                 stats.log_filter_rejection('no_entry_signal')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.info(f"⚠️ {normalized_symbol}: No entry signal - {entry_reason}")
                 return
             
-            # Market regime check
+            # Market regime
             regime = await regime_detector.detect_regime(self.exchange, normalized_symbol)
             if not regime_detector.should_trade_in_regime(regime):
                 stats.log_filter_rejection('regime_filter')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.info(f"⚠️ {normalized_symbol}: Regime filter - {regime}")
                 return
             
-            # Create and execute position
+            # Create position
             balance = await get_account_balance(self.exchange)
             position = await position_manager.create_position(
-                self.exchange, normalized_symbol, our_side, liq_price, liq_size_usd, vwap_ref, regime, balance
+                self.exchange, normalized_symbol, our_side, liq_price, 
+                liq_size_usd, vwap_ref, regime, balance
             )
             
             if position is None:
                 stats.log_filter_rejection('position_create_failed')
-                if CONFIG.debug.enable_filter_debug:
-                    logging.error(f"⚠️ {normalized_symbol}: Position creation failed")
                 return
             
             # Execute trade
             success = await self._execute_trade(position)
-            execution_time = time.time() - start_time
             stats.log_trade_attempt(success)
             
             if success:
                 self.entry_timestamps[normalized_symbol] = time.time()
                 
-                # Send Discord notification
                 if discord_notifier:
                     await discord_notifier.send_trade_alert(
                         normalized_symbol, our_side, position.total_qty, liq_price,
                         entry_reason, position.total_notional_used
                     )
                 
-                logging.info(f"🎯 TRADE SUCCESS: {normalized_symbol} | {entry_reason} | "
-                           f"Notional: ${position.total_notional_used:.2f} | Time: {execution_time:.2f}s")
-                
-                if CONFIG.debug.enable_trade_debug:
-                    debug_logger = logging.getLogger('trade_debug')
-                    debug_logger.debug(f"✅ EXECUTED: {normalized_symbol} {our_side} {position.total_qty:.6f} @ {liq_price:.6f}")
+                logging.info(f"TRADE SUCCESS: {normalized_symbol} | {entry_reason}")
             else:
                 position_manager.remove_position(normalized_symbol)
-                logging.warning(f"⚠️ TRADE FAILED: {normalized_symbol} in {execution_time:.2f}s")
                 
         except Exception as e:
-            total_time = time.time() - start_time
-            logging.error(f"⚠️ Processing error for {symbol}: {e} | Time: {total_time:.2f}s", exc_info=True)
+            logging.error(f"Processing error for {symbol}: {e}")
     
     async def _execute_trade(self, position: Position) -> bool:
-        """Execute the actual trade with enhanced error handling"""
+        """Execute trade"""
         try:
             normalized_symbol = normalize_symbol(position.symbol)
             ccxt_symbol = to_ccxt_symbol(normalized_symbol)
             
-            # Set leverage with enhanced error handling
+            # Set leverage
             try:
                 await self.exchange.set_margin_mode('cross', ccxt_symbol)
                 await self.exchange.set_leverage(CONFIG.leverage, ccxt_symbol)
             except Exception as e:
                 if "not modified" not in str(e).lower():
-                    logging.warning(f"Leverage setup failed for {normalized_symbol}: {e}")
+                    logging.warning(f"Leverage setup failed: {e}")
             
-            # Execute market order
+            # Execute order
             order = await self.exchange.create_market_order(
                 ccxt_symbol, position.side, position.total_qty,
                 params={"positionSide": "LONG" if position.side == "buy" else "SHORT"}
             )
             
-            # Update with actual execution price
+            # Update position with actual price
             actual_price = float(order.get('price', position.avg_entry_price)) or position.avg_entry_price
             position.avg_entry_price = actual_price
             position.total_notional_used = position.total_qty * actual_price
-
-            # Set initial take profit with enhanced error recovery
-            tp_success = await profit_protection.set_initial_take_profit(self.exchange, position)
-            if not tp_success:
-                logging.warning(f"⚠️ TP setup failed for {normalized_symbol}, position created without protection")
+            
+            # Set take profit
+            await profit_protection.set_initial_take_profit(self.exchange, position)
             
             return True
             
         except Exception as e:
-            logging.error(f"⚠️ Trade execution failed for {position.symbol}: {e}")
+            logging.error(f"Trade execution failed: {e}")
             return False
     
     async def monitor_positions(self):
-        """Enhanced position monitoring with better order management"""
+        """Monitor positions for DCA"""
         while True:
             try:
                 for symbol, position in list(position_manager.positions.items()):
@@ -2434,7 +2569,7 @@ class VWAPHunterStrategy:
                         if current_price <= 0:
                             continue
                         
-                        # Check DCA triggers
+                        # Check DCA
                         should_dca, dca_level = await position_manager.check_dca_trigger(symbol, current_price)
                         if should_dca and CONFIG.dca.enable:
                             success = await position_manager.execute_dca(
@@ -2442,17 +2577,14 @@ class VWAPHunterStrategy:
                             )
                             
                             if success:
-                                # Update TP/SL orders after DCA
                                 await profit_protection.update_orders_after_dca(self.exchange, position)
                                 
                     except Exception as e:
                         logging.error(f"Position monitoring error for {symbol}: {e}")
-                        continue
                 
-                await asyncio.sleep(10)  # Check every 10 seconds
+                await asyncio.sleep(10)
                 
             except asyncio.CancelledError:
-                logging.info("🛑 monitor_positions cancelled")
                 break
             except Exception as e:
                 logging.error(f"Position monitoring error: {e}")
@@ -2476,132 +2608,152 @@ async def periodic_stats_reporter():
             
             # Send to Discord if enabled
             if discord_notifier:
-                embed = {
-                    "title": "📊 Trading Statistics",
-                    "description": f"```{summary[:1800]}```",
-                    "color": 0x00ff88,
-                    "timestamp": datetime.utcnow().isoformat()
-                }
-                
-                await discord_notifier.initialize()
-                payload = {"username": "📊 0xLIQD Stats", "embeds": [embed]}
-                
-                try:
-                    async with discord_notifier.session.post(discord_notifier.webhook_url, json=payload) as response:
-                        if response.status == 204:
-                            logging.info("Stats update sent to Discord")
-                except:
-                    pass
+                await discord_notifier.send_stats_update(summary)
                     
         except Exception as e:
             logging.error(f"Stats reporting error: {e}")
             await asyncio.sleep(60)
 
 async def run_liquidation_stream_with_shutdown(strategy):
-    """Run liquidation stream with proper shutdown handling"""
-    uri = "wss://fstream.binance.com/stream?streams=!forceOrder@arr"
+    """Liquidation stream"""
+    
+    # Primary endpoints in order of preference
+    endpoints = [
+        "wss://fstream.binance.com/stream?streams=!forceOrder@arr",
+        "wss://stream.binance.com:9443/stream?streams=!forceOrder@arr",
+        "wss://dstream.binance.com/stream?streams=!forceOrder@arr"
+    ]
+    
+    current_endpoint = 0
     reconnect_delay = 5
+    max_delay = 60
     
     while not shutdown_handler.shutdown_event.is_set():
+        uri = endpoints[current_endpoint]
+        
         try:
-            logging.info("🔌 Connecting to Binance liquidation stream...")
+            logging.info(f"Connecting to liquidation stream (endpoint {current_endpoint + 1}/{len(endpoints)})...")
+            logging.debug(f"Using: {uri}")
             
-            import websockets
+            # Simple connection with conservative settings
+            ws = await asyncio.wait_for(
+                websockets.connect(
+                    uri,
+                    ping_interval=30,
+                    ping_timeout=20,
+                    close_timeout=5,
+                    max_size=2**20,
+                    compression=None
+                ), 
+                timeout=20
+            )
             
-            async with websockets.connect(uri) as ws:
-                logging.info("⚡ 0xLIQD ACTIVE")
-                reconnect_delay = 5
+            logging.info("⚡ 0xLIQD liquidation stream ACTIVE")
+            reconnect_delay = 5  # Reset on successful connection
+            current_endpoint = 0  # Reset to primary endpoint
+            
+            async with ws:
+                last_message = time.time()
                 
                 while not shutdown_handler.shutdown_event.is_set():
                     try:
-                        # Use wait_for with shutdown check
+                        # Wait for message with generous timeout
                         done, pending = await asyncio.wait([
                             asyncio.create_task(ws.recv()),
                             asyncio.create_task(shutdown_handler.shutdown_event.wait())
-                        ], return_when=asyncio.FIRST_COMPLETED, timeout=30.0)
+                        ], return_when=asyncio.FIRST_COMPLETED, timeout=45)
                         
                         # Cancel pending tasks
                         for task in pending:
                             task.cancel()
                         
-                        # Check if shutdown was triggered
                         if shutdown_handler.shutdown_event.is_set():
-                            logging.info("🛑 Shutdown event detected, closing websocket")
+                            logging.info("Shutdown event detected")
                             break
                         
-                        # Process websocket message
                         if done:
-                            result = done.pop().result()
-                            payload = json.loads(result)
+                            message = done.pop().result()
+                            last_message = time.time()
                             
-                            # Handle liquidation events
-                            events = payload.get("data", [])
-                            if not isinstance(events, list):
-                                events = [events]
-                            
-                            for event in events:
-                                if not shutdown_handler.shutdown_event.is_set():
-                                    asyncio.create_task(strategy.process_liquidation_event(event))
-                                    
+                            try:
+                                data = json.loads(message)
+                                events = data.get("data", [])
+                                if not isinstance(events, list):
+                                    events = [events]
+                                
+                                for event in events:
+                                    if not shutdown_handler.shutdown_event.is_set():
+                                        asyncio.create_task(strategy.process_liquidation_event(event))
+                                        
+                            except json.JSONDecodeError:
+                                # Normal ping/pong messages
+                                continue
+                            except Exception as e:
+                                logging.error(f"Message processing error: {e}")
+                                continue
+                        else:
+                            # Timeout - check if connection is stale
+                            if time.time() - last_message > 120:  # 2 minutes without messages
+                                logging.warning("Connection appears stale, reconnecting...")
+                                break
+                                
                     except websockets.exceptions.ConnectionClosed:
-                        logging.warning("Liquidation stream disconnected")
+                        logging.warning("Connection closed by server")
                         break
-                    except asyncio.TimeoutError:
-                        continue
                     except Exception as e:
-                        logging.error(f"Liquidation stream error: {e}")
+                        logging.error(f"WebSocket error: {e}")
                         break
                         
+        except asyncio.TimeoutError:
+            logging.warning(f"Connection timeout with endpoint {current_endpoint + 1}")
+            current_endpoint = (current_endpoint + 1) % len(endpoints)
+            
         except Exception as e:
             if shutdown_handler.shutdown_event.is_set():
                 break
             logging.error(f"Connection error: {e}")
-            logging.info(f"⏳ Reconnecting in {reconnect_delay}s...")
-            
-            # Wait for reconnect delay or shutdown event
+            current_endpoint = (current_endpoint + 1) % len(endpoints)
+        
+        if not shutdown_handler.shutdown_event.is_set():
+            logging.info(f"Reconnecting in {reconnect_delay}s...")
             try:
                 await asyncio.wait_for(
                     shutdown_handler.shutdown_event.wait(),
                     timeout=reconnect_delay
                 )
-                break  # Shutdown event triggered
+                break
             except asyncio.TimeoutError:
-                pass  # Continue with reconnect
+                pass
             
-            reconnect_delay = min(reconnect_delay * 1.5, 60)
+            reconnect_delay = min(reconnect_delay * 1.2, max_delay)
 
 # =============================================================================
 # MAIN BOT EXECUTION
 # =============================================================================
 
 async def main_bot():
-    """Enhanced main bot execution with graceful shutdown"""
+    """Main bot execution"""
     setup_enhanced_logging()
-    logging.info("⚡ 0xLIQD - STARTING UP...")
-    logging.info("=" * 70)
+    logging.info("0xLIQD - STARTING UP...")
     
     global data_manager
-    
-    # Setup signal handlers
     shutdown_handler.setup_signal_handlers()
     
-    # Initialize components
-    exchange = None
-    monitor_task = None
-    stats_task = None
-    liquidation_ws = None
-    
     try:
-        # Initialize CCXT Pro exchange
+        # Initialize exchange
         exchange = get_exchange()
-        logging.info("✅ CCXT Pro exchange connected")
+        logging.info("Exchange connected")
+
+        # Initialize timestamp management
+        success = await initialize_timestamp_management(exchange)
+        if not success:
+            logging.error("Timestamp management failed")
+            return
         
-        # Initialize CCXT Pro data manager
+        # Initialize data manager
         data_manager = CCXTProDataManager(exchange)
         shutdown_handler.register_component(data_manager, data_manager.close)
-        
         await data_manager.start_streaming()
-        logging.info("✅ CCXT Pro streaming initialized")
         
         # Initialize zones client
         await rapidapi_client.initialize()
@@ -2610,105 +2762,57 @@ async def main_bot():
         # Try to fetch fresh zones data
         zones_fetch_success = await rapidapi_client.fetch_zones_data()
         zones_count = rapidapi_client.get_zones_count()
-        
         if zones_count == 0:
-            logging.error("💥 No zones data available - cannot proceed")
+            logging.error("No zones data available")
             return
         
-        data_age = rapidapi_client.get_data_age_minutes()
-        logging.info(f"✅ Zones loaded: {zones_count} symbols, age: {data_age:.1f}min")
-        
-        # Auto-build trading pairs
+        # Build trading pairs
         pairs_data = await pairs_builder.build_trading_pairs(exchange)
         pairs_count = pairs_builder.get_pairs_count()
-        
         if pairs_count == 0:
-            logging.error("💥 No trading pairs built - cannot proceed")
+            logging.error("No trading pairs built")
             return
         
-        logging.info(f"✅ Trading pairs built: {pairs_count} enabled pairs")
-        
-        # Subscribe all trading pairs to CCXT Pro streams
+        # Subscribe symbols
         for symbol in pairs_data.keys():
             data_manager.subscribe_symbol(symbol)
         
-        logging.info(f"📡 Subscribed to {len(pairs_data)} symbols for CCXT Pro streaming")
-        
-        # Wait for streaming data to start flowing
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         
         # Initialize strategy
         strategy = VWAPHunterStrategy(exchange)
-        logging.info("✅ Strategy initialized with CCXT Pro integration")
         
-        # Start position monitoring
+        # Start monitoring
         await position_manager.start_order_monitoring(exchange)
         shutdown_handler.register_component(position_manager, position_manager.stop_order_monitoring)
         
         monitor_task = asyncio.create_task(strategy.monitor_positions())
-        logging.info("✅ Position monitoring started")
-        
-        # Start statistics reporting
         stats_task = asyncio.create_task(periodic_stats_reporter())
         
-        # Send startup notification
+        # Discord startup
         if discord_notifier:
             await discord_notifier.initialize()
             shutdown_handler.register_component(discord_notifier, discord_notifier.close)
             await discord_notifier.send_startup_alert(zones_count, pairs_count)
-            logging.info("✅ Discord notifications active")
         
-        # Configuration summary
-        logging.info("📋 Configuration:")
-        logging.info(f"  Max Positions: {CONFIG.risk.max_positions}")
-        logging.info(f"  CCXT Pro Streaming: ENABLED")
-        logging.info("=" * 70)
+        logging.info(f"Configuration: {CONFIG.risk.max_positions} max positions")
         
-        # Main liquidation stream with graceful shutdown support
+        # Main liquidation stream (SIMPLIFIED VERSION)
         await run_liquidation_stream_with_shutdown(strategy)
         
     except KeyboardInterrupt:
-        logging.info("🛑 Keyboard interrupt received")
+        logging.info("Shutdown requested")
     except Exception as e:
-        logging.error(f"💥 Fatal error: {e}", exc_info=True)
+        logging.error(f"Fatal error: {e}")
     finally:
-        logging.info("🧹 Starting cleanup...")
-        
-        # Cancel background tasks gracefully
-        tasks_to_cancel = []
-        
-        if monitor_task and not monitor_task.done():
-            tasks_to_cancel.append(monitor_task)
-            
-        if stats_task and not stats_task.done():
-            tasks_to_cancel.append(stats_task)
-        
-        # Cancel tasks
-        for task in tasks_to_cancel:
-            task.cancel()
-        
-        # Wait for tasks to complete with timeout
-        if tasks_to_cancel:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
-                    timeout=5.0
-                )
-            except asyncio.TimeoutError:
-                logging.warning("⚠️ Some tasks didn't complete within timeout")
-        
-        # Cleanup all registered components
+        # Cleanup
+        if 'monitor_task' in locals():
+            monitor_task.cancel()
+        if 'stats_task' in locals():
+            stats_task.cancel()
         await shutdown_handler.cleanup_all()
-        
-        # Close exchange last
         if exchange:
-            try:
-                await exchange.close()
-                logging.info("✅ Exchange connection closed")
-            except Exception as e:
-                logging.warning(f"⚠️ Exchange cleanup error: {e}")
-        
-        logging.info("✅ Shutdown complete")
+            await exchange.close()
 
 # =============================================================================
 # ENTRY POINT

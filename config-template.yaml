@@ -10,8 +10,6 @@ min_notional: 11            # Minimum trade size in USDT
 # RapidAPI Configuration
 rapidapi:
   api_key: ""
-  base_url: "https://liquidation-report.p.rapidapi.com"
-  endpoint: "/lickhunterpro"
   update_interval_minutes: 5          # Fetch fresh data every 5 minutes
   timeout_seconds: 30                 # API request timeout
   retry_attempts: 3                   # Number of retry attempts
@@ -84,7 +82,7 @@ momentum:
   max_daily_volatility: 30.0    # Avoid if daily range
   
   # Strategy mode
-  momentum_mode: "AVOID_EXTREMES"  # AVOID_EXTREMES, TARGET_MOMENTUM, ENHANCE_SIGNALS
+  momentum_mode: "AVOID_EXTREMES"  # AVOID_EXTREMES, ENHANCE_SIGNALS
 
 # Risk Management
 risk:

@@ -21,35 +21,39 @@
 
 ## 🚀 Features
 
-### Core Strategy Engine
-- **Real-time Liquidation Monitoring** - Direct Binance WebSocket streams for zero-latency detection
-- **VWAP-Enhanced Entry Signals** - Combines RapidAPI liquidation zones with real-time VWAP calculations
-- **Market Regime Detection** - ADX-based trend/range filtering with volatility analysis
-- **Advanced Momentum Filtering** - Multi-timeframe analysis to avoid overextended moves
+### Core Strategy
+- **Real-time Liquidation Monitoring** - WebSocket streams for instant liquidation detection
+- **VWAP-Based Entry Signals** - Combines RapidAPI price zones with real-time VWAP calculations
+- **Market Regime Detection** - ADX-based trend/range filtering for optimal entry conditions
+- **Momentum Filtering** - Configurable modes: AVOID_EXTREMES, ENHANCE_SIGNALS
+- **Auto Trading Pairs** - Automatically builds trading pairs from available zone data
 
-### Professional Risk Management
-- **Strict Position Limits** - Configurable maximum concurrent positions with race condition protection
-- **Isolation-Based Capital Allocation** - Percentage-based balance management with real-time monitoring
-- **Multi-Confirmation System** - Prevents false position closures and premature order cleanup
-- **Volume & Liquidity Filtering** - Minimum 24h volume requirements with real-time validation
+### Advanced Risk Management
+- **Isolation-Based Capital Allocation** - Configurable percentage of total balance
+- **Smart Position Limits** - Maximum concurrent positions with symbol-level locks
+- **Volume Filtering** - Minimum 24h volume requirements for liquidity assurance
+- **CCXT Pro Integration** - 95% reduction in REST API calls via WebSocket streams
+- **Enhanced Timestamp Management** - Periodic calibration with automatic drift correction
 
-### CCXT Pro Integration
-- **WebSocket-First Architecture** - 95% reduction in REST API calls and rate limit issues
-- **Real-time Position Sync** - Instant position updates via user data streams
-- **Automatic Reconnection** - Robust connection handling with graceful failover
-- **Symbol Normalization** - Unified symbol handling across all exchange formats
+### DCA System
+- **Configurable DCA Levels** - Up to 7 levels with custom trigger percentages
+- **Escalating Size Multipliers** - Increasing position sizes per DCA level
+- **Isolation Limit Checks** - Prevents over-leveraging during adverse moves
+- **Real-time TP Updates** - Automatic take-profit adjustments after DCA
 
-### Enhanced DCA System
-- **Multi-Level Averaging** - Up to 7 configurable DCA levels with smart triggers
-- **Dynamic Size Scaling** - Escalating position multipliers per DCA level
-- **Automatic TP Updates** - Real-time take-profit recalculation after each DCA
-- **Isolation Compliance** - DCA executions respect total exposure limits
+### Profit Protection
+- **Separate TP/SL Orders** - Independent take-profit and stop-loss management
+- **Order Monitoring System** - Real-time tracking of filled orders with counterpart cancellation
+- **Optional Stop-Loss Protection** - Risk management for extreme moves
+- **Real-time Position Sync** - CCXT Pro position monitoring
+- **P&L Tracking** - Accurate profit/loss calculations with Discord alerts
 
-### Professional Monitoring
-- **Graceful Shutdown** - Clean Ctrl+C handling with proper task cleanup
-- **Comprehensive Logging** - Structured logs with rotation and debug levels
-- **Discord Integration** - Real-time trade alerts and P&L notifications
-- **Performance Analytics** - Detailed statistics and filter effectiveness metrics
+### Monitoring & Analytics
+- **Comprehensive Logging** - Debug, trade, and filter logs with rotation
+- **Performance Statistics** - Real-time trading metrics and analysis
+- **Discord Integration** - Trade alerts, P&L notifications, and status updates
+- **Health Monitoring** - Connection status and automatic reconnection
+- **Enhanced Error Handling** - Graceful degradation and recovery
 
 ---
 
@@ -58,7 +62,7 @@
 ### Prerequisites
 - Python 3.8 or higher
 - Binance Futures API account with trading permissions
-- RapidAPI Pro subscription for liquidation data (recommended)
+- RapidAPI Pro subscription ($6/month) for liquidation data
 
 ### Quick Setup
 
@@ -68,17 +72,17 @@ git clone https://github.com/s3ji/0xliqd.git
 cd 0xliqd
 ```
 
-2. **Run the automated setup**
+2. **Run the setup script**
 ```bash
 chmod +x start_bot.sh
 ./start_bot.sh
 ```
 
 The script automatically:
-- Creates Python virtual environment
-- Installs all dependencies (including CCXT Pro)
-- Sets up directory structure
-- Launches the bot with proper configuration
+- Creates and activates Python virtual environment
+- Installs all required dependencies
+- Creates logs directory structure
+- Launches the bot
 
 ### Manual Installation
 
@@ -93,7 +97,7 @@ pip install -r requirements.txt
 # Create configuration
 cp config-template.yaml config.yaml
 
-# Edit your configuration
+# Edit configuration (see Configuration section)
 nano config.yaml
 
 # Run the bot
@@ -104,43 +108,41 @@ python3 0xliqd.py
 
 ## ⚙️ Configuration
 
-### Required API Keys
+### API Keys Required
 
 1. **Binance Futures API**
-   - Visit [Binance API Management](https://www.binance.com/en/my/settings/api-management)
-   - Create API key with futures trading permissions
-   - **Important**: Restrict to your IP address for security
+   - Go to [Binance API Management](https://www.binance.com/en/my/settings/api-management)
+   - Create new API key with futures trading permissions
+   - Restrict to your IP address for security
 
 2. **RapidAPI Liquidation Data**
    - Subscribe to [Liquidation Report API](https://rapidapi.com/AtsutaneDotNet/api/liquidation-report)
-   - Pro subscription recommended for reliable data
-   - Used for liquidation zone calculations
+   - Required for real-time liquidation zones
+   - Pro subscription recommended for full features
 
 3. **Discord Webhook (Optional)**
    - Create webhook in your Discord server
-   - Enables real-time trade notifications
+   - Used for trade alerts and notifications
 
-### Enhanced Configuration
+### Configuration File
 
-Create `config.yaml` with these settings:
+Create `config.yaml` from the template:
 
 ```yaml
-# Core API Configuration
+# API Configuration
 api_key: "your_binance_api_key"
 api_secret: "your_binance_api_secret"
 discord_webhook_url: "your_discord_webhook_url"
 
-# Trading Parameters
+# Core Trading Settings
 leverage: 10                # Trading leverage (1-100)
 min_notional: 11            # Minimum trade size in USDT
-
-# Enhanced Risk Management
 risk:
-  isolation_pct: 0.6        # 60% of balance maximum usage
-  max_positions: 2          # Strict position limit with race protection
-  min_24h_volume: 15000000  # $15M minimum daily volume
+  isolation_pct: 0.50       # Maximum % of balance to use (0.5 = 50%)
+  max_positions: 2          # Maximum concurrent positions
+  min_24h_volume: 10000000  # Minimum $10M daily volume
 
-# RapidAPI Integration
+# RapidAPI Configuration
 rapidapi:
   api_key: "your_rapidapi_key"
   update_interval_minutes: 5
@@ -151,49 +153,49 @@ rapidapi:
 # VWAP Strategy Settings
 vwap:
   period: 200               # VWAP calculation period
-  long_offset_pct: 0.8     # Long entry offset from VWAP
-  short_offset_pct: 0.8    # Short entry offset from VWAP
-  use_rapidapi_zones: true # Primary zone source
-  vwap_enhancement: true   # Blend with real-time VWAP
+  use_rapidapi_zones: true  # Use RapidAPI zones as primary
+  vwap_enhancement: true    # Blend with real-time VWAP
+  long_offset_pct: 0.8      # Long entry offset from VWAP
+  short_offset_pct: 0.8     # Short entry offset from VWAP
 
-# Advanced DCA Configuration
+# DCA Configuration
 dca:
   enable: true
-  max_levels: 5            # Reduced for better risk management
-  trigger_pcts: [0.05, 0.07, 0.09, 0.11, 0.13]  # DCA trigger percentages
-  size_multipliers: [1.5, 2.0, 2.5, 3.0, 3.5]  # Position size multipliers
+  max_levels: 7
+  trigger_pcts: [0.05, 0.07, 0.09, 0.11, 0.13, 0.15, 0.17]
+  size_multipliers: [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5]
 
-# Profit Protection System
+# Profit Protection
 profit_protection:
-  initial_tp_pct: 0.008    # 0.8% take profit (enhanced from 0.484%)
-  enable_stop_loss: false  # Optional stop loss
-  stop_loss_pct: 0.02      # 2% stop loss if enabled
+  initial_tp_pct: 0.005     # 0.5% take profit
+  enable_stop_loss: false   # Optional stop loss
+  stop_loss_pct: 0.02       # 2% stop loss if enabled
 
-# Enhanced Momentum Filtering
+# Momentum Filtering
 momentum:
   enable_momentum_filter: true
-  momentum_mode: "AVOID_EXTREMES"  # Strategy mode
-  daily_pump_threshold: 15.0       # Avoid if >15% daily pump
-  daily_dump_threshold: -10.0      # Avoid if <-10% daily dump
-  hourly_pump_threshold: 8.0       # Avoid if >8% hourly pump
-  hourly_dump_threshold: -6.0      # Avoid if <-6% hourly dump
-  min_daily_volatility: 5.0        # Minimum daily range required
-  max_daily_volatility: 50.0       # Maximum daily range allowed
+  momentum_mode: "AVOID_EXTREMES"  # AVOID_EXTREMES, ENHANCE_SIGNALS
+  daily_pump_threshold: 15.0       # Avoid if >15% daily move
+  daily_dump_threshold: -10.0      # Avoid if <-10% daily move
+  hourly_pump_threshold: 8.0       # Avoid if >8% hourly move
+  hourly_dump_threshold: -6.0      # Avoid if <-6% hourly move
+  min_daily_volatility: 5.0        # Minimum daily range
+  max_daily_volatility: 50.0       # Maximum daily range
 
-# Market Regime Analysis
+# Market Regime Detection
 market_regime:
-  regime_filter: true       # Enable regime-based filtering
+  regime_filter: true       # Enable regime filtering
   adx_period: 14           # ADX calculation period
-  trend_threshold: 25.0    # ADX threshold for trending markets
-  range_threshold: 20.0    # ADX threshold for ranging markets
+  trend_threshold: 25.0     # ADX threshold for trending markets
+  range_threshold: 20.0     # ADX threshold for ranging markets
 
-# Enhanced Debug & Monitoring
+# Debug Settings
 debug:
-  enable_trade_debug: true      # Detailed trade logging
-  enable_filter_debug: true     # Filter decision logging
-  enable_data_debug: true       # Data stream debugging
-  log_all_liquidations: true    # Log all liquidation events
-  stats_interval_minutes: 5     # Statistics reporting interval
+  enable_trade_debug: true
+  enable_filter_debug: true
+  enable_data_debug: true
+  log_all_liquidations: true
+  stats_interval_minutes: 5
 ```
 
 ---
@@ -202,7 +204,7 @@ debug:
 
 ### Starting the Bot
 
-**Recommended method:**
+**Recommended (using script):**
 ```bash
 ./start_bot.sh
 ```
@@ -213,267 +215,172 @@ source venv/bin/activate
 python3 0xliqd.py
 ```
 
-### Enhanced Startup Sequence
+### Stopping the Bot
+- Press `Ctrl+C` for graceful shutdown
+- Bot will close all WebSocket connections and save state
 
-The bot now performs comprehensive initialization:
+### Monitoring
 
-1. **Configuration Validation** - Verifies all required settings
-2. **CCXT Pro Connection** - Establishes WebSocket streams
-3. **Zone Data Loading** - Fetches liquidation zones from RapidAPI
-4. **Trading Pairs Building** - Auto-generates enabled pairs
-5. **WebSocket Subscriptions** - Subscribes to all relevant data streams
-6. **Position Monitoring** - Starts real-time position tracking
-7. **Liquidation Stream** - Connects to Binance liquidation feed
+**Log Files:**
+- `logs/0xliqd.log` - Main application log
+- `logs/debug_trades.log` - Detailed trade debugging
+- `price_zones_cache.json` - Cached liquidation zones
+- `trading_pairs_auto.json` - Auto-generated trading pairs
 
-### Graceful Shutdown
-
-- Press `Ctrl+C` for clean shutdown
-- All WebSocket connections closed properly
-- Open orders cancelled safely
-- No hanging processes or error messages
-
-### Real-time Monitoring
-
-**Enhanced Log Files:**
-- `logs/0xliqd.log` - Main application log with structured entries
-- `logs/debug_trades.log` - Detailed trade analysis and debugging
-- `price_zones_cache.json` - Cached liquidation zones with timestamps
-- `trading_pairs_auto.json` - Auto-generated trading pairs configuration
-
-**Live Monitoring:**
-- Console output with real-time trade signals
-- Discord notifications for all trade actions
-- Position limit enforcement messages
-- Filter rejection statistics
+**Real-time Monitoring:**
+- Discord notifications (if configured)
+- Console output with trade alerts
+- Periodic statistics reports
 
 ---
 
-## 📊 Enhanced Strategy
+## 📊 Strategy Overview
 
-### How the Strategy Works
+### How It Works
 
-1. **Multi-Source Liquidation Detection**
-   - Direct Binance liquidation WebSocket stream
-   - Real-time processing of large liquidations
-   - Symbol normalization and validation
+1. **Liquidation Detection**
+   - Monitors Binance liquidation stream via WebSocket
+   - Captures large liquidations that may cause price inefficiencies
+   - Uses multiple endpoint fallbacks for reliability
 
-2. **Advanced Multi-Layer Filtering**
-   - **Pair Validation**: Auto-generated enabled pairs only
-   - **Position Limits**: Strict enforcement with race condition protection  
-   - **Volume Requirements**: Real-time 24h volume validation
-   - **Momentum Analysis**: Multi-timeframe momentum calculations
-   - **Zone Validation**: RapidAPI liquidation zones with caching
-   - **Regime Assessment**: ADX-based market condition analysis
+2. **Multi-Layer Filtering**
+   - **Pair Validation**: Only auto-generated enabled trading pairs
+   - **Position Limits**: Respect maximum concurrent positions
+   - **Volume Filter**: Minimum 24h volume for liquidity
+   - **Momentum Filter**: Configurable modes to avoid/enhance signals
+   - **Zones Validation**: Require liquidation zone data from RapidAPI
+   - **Regime Filter**: Market condition appropriateness via ADX
 
-3. **Enhanced Entry Signal Logic**
-   - **Long Signals**: Liquidation price ≤ Dynamic long zone
-   - **Short Signals**: Liquidation price ≥ Dynamic short zone
-   - **VWAP Integration**: Real-time VWAP blending with zones
-   - **Confirmation System**: Multiple checks prevent false signals
+3. **Entry Signal Generation**
+   - **Long Signals**: Liquidation price ≤ Long zone level
+   - **Short Signals**: Liquidation price ≥ Short zone level
+   - Combines RapidAPI zones with real-time VWAP enhancement
 
-4. **Professional Risk Management**
-   - **Fixed Notional**: Consistent trade sizing
-   - **Isolation Enforcement**: Real-time balance percentage monitoring
-   - **Position Verification**: Multi-confirmation closure detection
-   - **Rate Limit Protection**: WebSocket-first architecture
+4. **Risk Management**
+   - Fixed notional per trade (configurable)
+   - Isolation percentage limits total exposure
+   - Separate take-profit and stop-loss orders
+   - Symbol-level position locks prevent race conditions
 
-5. **Enhanced DCA System**
-   - **Smart Triggers**: Percentage-based adverse move detection
-   - **Dynamic Scaling**: Escalating position sizes per level
-   - **TP Recalculation**: Automatic profit target updates
-   - **Isolation Compliance**: Respects total exposure limits throughout
+5. **DCA System**
+   - Triggers on adverse price moves with configurable thresholds
+   - Escalating position sizes per level
+   - Automatic order updates after DCA execution
+   - Respects isolation limits to prevent over-leveraging
 
-### Key Improvements in This Version
+6. **Profit Protection**
+   - Independent TP and SL order management
+   - Real-time order monitoring with automatic counterpart cancellation
+   - Position closure detection with P&L calculations
 
-#### Position Management Fixes
-- **Race Condition Protection**: Prevents multiple positions on same symbol
-- **False Closure Prevention**: Multi-confirmation system before order cleanup
-- **Symbol Normalization**: Consistent handling across all exchange formats
-- **Max Position Enforcement**: Strict limits with proper counting
+### Performance Metrics
 
-#### CCXT Pro Integration
-- **WebSocket Priority**: Primary data source for positions, prices, and OHLCV
-- **Rate Limit Elimination**: 95% reduction in REST API calls
-- **Real-time Updates**: Instant position and balance synchronization
-- **Automatic Failover**: Graceful REST API fallback when needed
-
-#### Enhanced Reliability
-- **Graceful Shutdown**: Clean Ctrl+C handling with proper cleanup
-- **Connection Recovery**: Automatic WebSocket reconnection
-- **Error Handling**: Comprehensive exception management
-- **Data Validation**: Input sanitization and format verification
+The bot tracks comprehensive statistics:
+- **Filter Effectiveness**: Rejection reasons and counts
+- **Trade Performance**: Success/failure rates
+- **DCA Analytics**: Level triggers and success rates
+- **Symbol Analysis**: Most liquidated pairs
+- **System Health**: WebSocket connection status and timestamp calibration
 
 ---
 
-## 📈 Performance Features
+## 🔧 Technical Features
 
-### WebSocket Architecture Benefits
-- **Zero Latency**: Direct Binance streams for instant data
-- **Rate Limit Free**: WebSocket streams have no rate limits
-- **Real-time Sync**: Positions and balances updated instantly
-- **Reduced Errors**: Eliminates most API timeout issues
+### CCXT Pro Integration
+- **Real-time Data Streams**: Balance, positions, prices, and OHLCV
+- **Optimized API Usage**: 95% reduction in REST API calls
+- **Intelligent Caching**: Fresh data prioritization with fallbacks
+- **Symbol Subscription**: Automatic market data subscription
 
-### Advanced Position Tracking
-- **Multi-Confirmation Closure**: Prevents premature order cancellation
-- **Symbol Lock System**: Prevents race conditions during position creation
-- **Grace Period Protection**: Prevents rapid re-entries on same symbol
-- **Authoritative Verification**: Cross-validates position data sources
+### Enhanced Timestamp Management
+- **Periodic Calibration**: Automatic timestamp offset correction
+- **Drift Detection**: Monitors and adjusts for clock differences
+- **Multiple Sampling**: Median-based calibration for accuracy
+- **Safety Margins**: Conservative timing to prevent rejections
 
-### Enhanced Risk Controls
-- **Dynamic Isolation**: Real-time balance percentage enforcement
-- **Volume Validation**: Continuous liquidity requirement checking
-- **Momentum Filtering**: Multi-timeframe analysis prevents bad entries
-- **Regime Awareness**: Market condition-based trade filtering
+### Order Management
+- **Separate TP/SL Orders**: Independent profit and loss management
+- **Order Monitoring**: Real-time status tracking
+- **Automatic Cancellation**: Cancel counterpart orders when one fills
+- **Position Synchronization**: Exchange position verification
 
----
-
-## 🛡️ Risk Management Features
-
-### Position Limits
-- **Maximum Concurrent Positions**: Configurable limit (default: 2)
-- **Symbol-Level Locks**: Prevents duplicate positions
-- **Race Condition Protection**: Atomic position creation checks
-- **Real-time Enforcement**: Continuous monitoring and validation
-
-### Capital Protection
-- **Isolation Percentage**: Maximum balance usage (recommended: 50-60%)
-- **Dynamic Monitoring**: Real-time balance tracking
-- **DCA Compliance**: All averaging respects isolation limits
-- **Emergency Stops**: Position creation halts if limits exceeded
-
-### Data Quality Assurance
-- **Multi-Source Verification**: Cross-validates position data
-- **Freshness Checks**: Ensures data currency before decisions
-- **Error Recovery**: Graceful handling of temporary data issues
-- **Backup Systems**: REST API fallback for critical operations
+### Momentum Detection
+- **Multi-timeframe Analysis**: 1h, 4h, and 24h momentum
+- **Volatility Metrics**: Range and volume spike detection
+- **Strategy Modes**: 
+  - AVOID_EXTREMES: Skip overextended moves
+  - ENHANCE_SIGNALS: Filter for quality setups
 
 ---
 
-## ⚠️ Enhanced Risk Warnings
+## 🔧 File Structure
 
-> **CRITICAL WARNING**: This is a leveraged futures trading bot. You can lose your entire account balance and more.
-
-### Important Risk Factors
-
-- **Leverage Amplifies Losses**: 10x leverage means 10% adverse move = 100% loss
-- **Market Volatility**: Crypto futures are extremely volatile
-- **Technical Risks**: Software bugs, connection issues, or exchange problems
-- **Liquidation Risk**: Positions can be liquidated during extreme moves
-- **Capital Requirements**: Ensure adequate margin for DCA levels
-
-### Enhanced Safety Recommendations
-
-1. **Start with Minimal Capital**: Test thoroughly with small amounts
-2. **Conservative Isolation**: Use 50% or less of total balance
-3. **Position Limits**: Start with max 1-2 concurrent positions
-4. **Monitor Actively**: Check Discord alerts and logs regularly
-5. **Stable Connection**: Ensure reliable internet and VPS hosting
-6. **API Security**: Use IP restrictions and minimal permissions
-7. **Regular Updates**: Keep bot updated with latest fixes
-
----
-
-## 🔧 Technical Architecture
-
-### File Structure
 ```
 0xliqd/
-├── 0xliqd.py                 # Main bot application (enhanced)
+├── 0xliqd.py                 # Main bot application
 ├── config-template.yaml      # Configuration template
-├── config.yaml              # Your configuration file
-├── requirements.txt          # Dependencies (includes CCXT Pro)
+├── config.yaml              # Your configuration (create from template)
+├── requirements.txt          # Python dependencies
 ├── start_bot.sh             # Automated setup script
 ├── README.md                # This documentation
-├── logs/                    # Enhanced logging directory
+├── logs/                    # Log files directory
 │   ├── 0xliqd.log          # Main application log
 │   └── debug_trades.log    # Detailed trade debugging
 ├── price_zones_cache.json   # Cached liquidation zones
 └── trading_pairs_auto.json # Auto-generated trading pairs
 ```
 
-### Key Components
+---
 
-#### Enhanced Position Manager
-- Race condition protection with atomic operations
-- Multi-confirmation closure detection
-- Grace period enforcement for symbol re-entries
-- Symbol normalization and format handling
+## ⚠️ Risk Warnings
 
-#### CCXT Pro Data Manager
-- WebSocket-first architecture for all market data
-- Real-time position and balance synchronization
-- Automatic reconnection with exponential backoff
-- Graceful fallback to REST API when needed
+> **HIGH RISK WARNING**: This bot trades leveraged futures contracts. You can lose more than your initial investment.
 
-#### Advanced Risk Controller
-- Real-time isolation percentage monitoring
-- Dynamic position limit enforcement
-- Volume and liquidity validation
-- Market regime and momentum filtering
+### Important Considerations
 
-#### Professional Monitoring System
-- Structured logging with rotation
-- Discord integration for alerts
-- Performance metrics and statistics
-- Graceful shutdown with proper cleanup
+- **Start Small**: Test with minimal capital first
+- **Understand Leverage**: Higher leverage = higher risk
+- **Monitor Actively**: Check Discord notifications and logs regularly
+- **API Security**: Use IP restrictions and minimal required permissions
+- **Market Conditions**: Performance varies significantly with market volatility
+
+### Best Practices
+
+1. **Never risk more than you can afford to lose**
+2. **Use appropriate isolation percentages (50% or less recommended)**
+3. **Monitor Discord alerts for trade notifications**
+4. **Regularly review log files for issues**
+5. **Keep the bot updated with latest versions**
+6. **Test configuration changes with small amounts first**
 
 ---
 
-## 🚀 Getting Started Checklist
+## 🛡️ Security Features
 
-### Pre-Launch Setup
-- [ ] Create Binance Futures account with API access
-- [ ] Subscribe to RapidAPI Liquidation Report (Pro recommended)
-- [ ] Set up Discord webhook for notifications (optional)
-- [ ] Configure VPS or stable hosting environment
-- [ ] Install Python 3.8+ and required dependencies
-
-### Configuration Steps
-- [ ] Copy `config-template.yaml` to `config.yaml`
-- [ ] Add Binance API credentials with IP restrictions
-- [ ] Configure RapidAPI key for liquidation data
-- [ ] Set conservative risk parameters (50% isolation, 2 max positions)
-- [ ] Enable debug logging for initial testing
-- [ ] Add Discord webhook for trade notifications
-
-### Testing & Validation
-- [ ] Run bot with minimal capital ($50-100)
-- [ ] Verify position limits are respected
-- [ ] Test graceful shutdown (Ctrl+C)
-- [ ] Monitor Discord notifications
-- [ ] Check log files for errors
-- [ ] Validate DCA system with small positions
-
-### Production Deployment
-- [ ] Increase capital after successful testing
-- [ ] Monitor performance for first 24-48 hours
-- [ ] Adjust risk parameters based on results
-- [ ] Set up log monitoring and alerts
-- [ ] Create backup and recovery procedures
+- **API Key Encryption**: Store keys securely in config file
+- **IP Restrictions**: Recommended for Binance API
+- **Minimal Permissions**: Only futures trading required
+- **Rate Limit Protection**: CCXT Pro streams reduce API pressure
+- **Position Verification**: Real-time sync with exchange
+- **Error Handling**: Comprehensive error recovery and logging
 
 ---
 
-## 📞 Support & Community
+## 📈 Advanced Configuration
 
-### Getting Help
-- **Issues**: [GitHub Issues](https://github.com/s3ji/0xliqd/issues)
-- **Documentation**: This README and inline code comments
+### Momentum Modes
+- **AVOID_EXTREMES**: Skip trades on overextended price moves
+- **ENHANCE_SIGNALS**: Filter for higher quality setups with volume confirmation
 
-### Reporting Issues
-Include these details when reporting problems:
-- Python version and operating system
-- Full error messages and stack traces
-- Configuration file (remove sensitive keys)
-- Log file excerpts showing the issue
-- Steps to reproduce the problem
+### Market Regime Detection
+- **TREND_UP/DOWN**: Strong directional movement
+- **RANGE**: Sideways price action
+- **VOLATILE**: High volatility without clear direction
 
-### Feature Requests
-We welcome suggestions for improvements:
-- Strategy enhancements
-- Risk management features
-- Performance optimizations
-- Additional exchange support
-- UI/UX improvements
+### Auto Trading Pairs
+- Automatically generates trading pairs from available zone data
+- Matches RapidAPI zones with Binance futures markets
+- Configures precision and step sizes automatically
 
 ---
 
