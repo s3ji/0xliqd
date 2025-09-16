@@ -96,8 +96,14 @@ class MomentumConfig:
     min_daily_volatility: float = 5.0
     max_daily_volatility: float = 50.0
     momentum_mode: str = "AVOID_EXTREMES"
-    momentum_lookback_hours: int = 24
-    volatility_lookback_hours: int = 24
+
+@dataclass
+class PairAgeConfig:
+    """Configuration for pair age filtering"""
+    min_age_days: int = 30
+    enable_age_filter: bool = True
+    cache_duration_hours: int = 24
+    api_timeout_seconds: int = 10
 
 @dataclass
 class Config:
@@ -115,6 +121,7 @@ class Config:
     risk: RiskConfig = field(default_factory=RiskConfig)
     debug: DebugConfig = field(default_factory=DebugConfig)
     momentum: MomentumConfig = field(default_factory=MomentumConfig)
+    pair_age: PairAgeConfig = field(default_factory=PairAgeConfig)
     enable_discord: bool = True
     log_file: str = "0xliqd.log"
     pairs_file: str = "trading_pairs_auto.json"
@@ -132,11 +139,11 @@ def load_config() -> Config:
                 for key, value in file_config.items():
                     if hasattr(config, key) and not isinstance(getattr(config, key),
                         (RapidAPIConfig, VWAPConfig, DCAConfig, ProfitProtectionConfig, 
-                         MarketRegimeConfig, RiskConfig, DebugConfig, MomentumConfig)):
+                         MarketRegimeConfig, RiskConfig, DebugConfig, MomentumConfig, PairAgeConfig)):
                         setattr(config, key, value)
                 
                 for sub_config_name in ['rapidapi', 'vwap', 'dca', 'profit_protection', 
-                                       'market_regime', 'risk', 'debug', 'momentum']:
+                                       'market_regime', 'risk', 'debug', 'momentum', 'pair_age']:
                     if sub_config_name in file_config:
                         sub_config = getattr(config, sub_config_name)
                         for key, value in file_config[sub_config_name].items():
@@ -265,6 +272,183 @@ class GracefulShutdownHandler:
 shutdown_handler = GracefulShutdownHandler()
 
 # =============================================================================
+# PAIR AGE FILTER
+# =============================================================================
+
+class PairAgeFilter:
+    """Filter trading pairs based on listing age"""
+    
+    def __init__(self):
+        self.age_cache: Dict[str, Dict] = {}
+        self.session: Optional[aiohttp.ClientSession] = None
+        
+    async def initialize(self):
+        """Initialize HTTP session"""
+        if not self.session or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=CONFIG.pair_age.api_timeout_seconds)
+            self.session = aiohttp.ClientSession(timeout=timeout)
+    
+    async def get_pair_listing_date(self, exchange, symbol: str) -> Optional[datetime]:
+        """Get pair listing date using multiple methods"""
+        
+        # Method 1: Try exchange API for market info
+        try:
+            markets = await exchange.load_markets()
+            ccxt_symbol = to_ccxt_symbol(symbol)
+            
+            if ccxt_symbol in markets:
+                market_info = markets[ccxt_symbol]
+                # Some exchanges provide listing timestamp in market info
+                if 'info' in market_info and isinstance(market_info['info'], dict):
+                    listing_time = market_info['info'].get('listingDate') or market_info['info'].get('onboardDate')
+                    if listing_time:
+                        try:
+                            return datetime.fromtimestamp(int(listing_time) / 1000)
+                        except (ValueError, TypeError):
+                            pass
+                        
+        except Exception as e:
+            logging.debug(f"Market info method failed for {symbol}: {e}")
+        
+        # Method 2: Try historical klines approach
+        try:
+            return await self._get_listing_date_from_klines(exchange, symbol)
+        except Exception as e:
+            logging.debug(f"Klines method failed for {symbol}: {e}")
+        
+        # Method 3: Try Binance public API
+        try:
+            return await self._get_listing_date_from_binance_api(symbol)
+        except Exception as e:
+            logging.debug(f"Binance API method failed for {symbol}: {e}")
+        
+        return None
+    
+    async def _get_listing_date_from_klines(self, exchange, symbol: str) -> Optional[datetime]:
+        """Get listing date by finding earliest available kline data"""
+        try:
+            ccxt_symbol = to_ccxt_symbol(symbol)
+            
+            # Try to get very old data (2 years ago)
+            two_years_ago = int((datetime.now() - timedelta(days=730)).timestamp() * 1000)
+            
+            # Fetch klines from 2 years ago with limit 1
+            klines = await exchange.fetch_ohlcv(
+                ccxt_symbol, 
+                '1d', 
+                since=two_years_ago, 
+                limit=1
+            )
+            
+            if klines and len(klines) > 0:
+                # First available timestamp
+                first_timestamp = klines[0][0]
+                return datetime.fromtimestamp(first_timestamp / 1000)
+                
+        except Exception as e:
+            logging.debug(f"Klines listing date failed for {symbol}: {e}")
+        
+        return None
+    
+    async def _get_listing_date_from_binance_api(self, symbol: str) -> Optional[datetime]:
+        """Get listing date from Binance public API"""
+        try:
+            await self.initialize()
+            
+            # Binance doesn't have a direct listing date API, but we can try exchange info
+            url = "https://api.binance.com/api/v3/exchangeInfo"
+            
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    
+                    # Find our symbol in the symbols list
+                    for symbol_info in data.get('symbols', []):
+                        if symbol_info.get('symbol') == normalize_symbol(symbol):
+                            # Some symbols have baseAssetPrecision or other timing info
+                            # This is limited but we can try
+                            if 'permissions' in symbol_info:
+                                # If it has SPOT and MARGIN permissions, it's likely older
+                                # This is a heuristic approach
+                                permissions = symbol_info.get('permissions', [])
+                                if len(permissions) > 1:
+                                    # Assume older pairs (rough heuristic)
+                                    return datetime.now() - timedelta(days=365)
+                            break
+                            
+        except Exception as e:
+            logging.debug(f"Binance API listing date failed for {symbol}: {e}")
+        
+        return None
+    
+    async def get_pair_age_days(self, exchange, symbol: str) -> Optional[int]:
+        """Get pair age in days with caching"""
+        normalized_symbol = normalize_symbol(symbol)
+        
+        # Check cache
+        if normalized_symbol in self.age_cache:
+            cache_entry = self.age_cache[normalized_symbol]
+            cache_age = datetime.now() - cache_entry['cached_at']
+            
+            if cache_age < timedelta(hours=CONFIG.pair_age.cache_duration_hours):
+                return cache_entry['age_days']
+        
+        # Fetch fresh data
+        listing_date = await self.get_pair_listing_date(exchange, normalized_symbol)
+        
+        if listing_date:
+            age_days = (datetime.now() - listing_date).days
+            
+            # Cache result
+            self.age_cache[normalized_symbol] = {
+                'age_days': age_days,
+                'listing_date': listing_date,
+                'cached_at': datetime.now()
+            }
+            
+            logging.debug(f"Pair age: {normalized_symbol} = {age_days} days (listed: {listing_date.strftime('%Y-%m-%d')})")
+            return age_days
+        else:
+            # Cache negative result to avoid repeated failed lookups
+            self.age_cache[normalized_symbol] = {
+                'age_days': None,
+                'listing_date': None,
+                'cached_at': datetime.now()
+            }
+            
+            logging.debug(f"Could not determine age for {normalized_symbol}")
+            return None
+    
+    async def should_trade_pair(self, exchange, symbol: str) -> tuple[bool, str]:
+        """Check if pair meets age requirements"""
+        if not CONFIG.pair_age.enable_age_filter:
+            return True, "Age filter disabled"
+        
+        age_days = await self.get_pair_age_days(exchange, symbol)
+        
+        if age_days is None:
+            # If we can't determine age, you can choose to:
+            # Option 1: Allow trading (assume it's old enough)
+            # Option 2: Reject trading (be conservative)
+            # I'll implement Option 1 but you can change this
+            return True, "Age unknown - allowing trade"
+        
+        min_age = CONFIG.pair_age.min_age_days
+        
+        if age_days >= min_age:
+            return True, f"Pair age: {age_days} days (>= {min_age})"
+        else:
+            return False, f"Pair too new: {age_days} days (< {min_age})"
+    
+    async def close(self):
+        """Clean shutdown"""
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+# Global instance
+pair_age_filter = PairAgeFilter()
+
+# =============================================================================
 # STATISTICS TRACKING
 # =============================================================================
 
@@ -285,6 +469,7 @@ class TradingStatistics:
             'max_positions': 0,
             'volume_filter': 0,
             'momentum_filter': 0,
+            'pair_age_filter': 0,
             'no_zones': 0,
             'old_data': 0,
             'invalid_vwap': 0,
@@ -2047,6 +2232,13 @@ class PositionManager:
         else:
             adverse_move = (current_price - position.avg_entry_price) / position.avg_entry_price
         
+        # DEBUG: Log the calculation
+        if position.dca_count < len(CONFIG.dca.trigger_pcts):
+            trigger_threshold = CONFIG.dca.trigger_pcts[position.dca_count]
+            logging.info(f"DCA CHECK {symbol}: Price={current_price:.6f}, Entry={position.avg_entry_price:.6f}, "
+                        f"Adverse={adverse_move*100:.2f}%, Threshold={trigger_threshold*100:.2f}%, "
+                        f"DCA_Level={position.dca_count}")
+
         # Check trigger
         if position.dca_count < len(CONFIG.dca.trigger_pcts):
             trigger_threshold = CONFIG.dca.trigger_pcts[position.dca_count]
@@ -2449,6 +2641,14 @@ class VWAPHunterStrategy:
                 stats.log_filter_rejection('pair_not_enabled')
                 return
             
+            # Age filter check
+            age_pass, age_reason = await pair_age_filter.should_trade_pair(self.exchange, normalized_symbol)
+            if not age_pass:
+                stats.log_filter_rejection('pair_age_filter')
+                if CONFIG.debug.enable_filter_debug:
+                    logging.info(f"AGE FILTER REJECT: {normalized_symbol} - {age_reason}")
+                return
+            
             volume_pass, daily_volume = await self.check_volume_filter(normalized_symbol)
             if not volume_pass:
                 stats.log_filter_rejection('volume_filter')
@@ -2572,6 +2772,7 @@ class VWAPHunterStrategy:
                         # Check DCA
                         should_dca, dca_level = await position_manager.check_dca_trigger(symbol, current_price)
                         if should_dca and CONFIG.dca.enable:
+                            logging.info(f"DCA TRIGGER: {symbol} at level {dca_level}")
                             success = await position_manager.execute_dca(
                                 self.exchange, symbol, current_price, dca_level
                             )
@@ -2772,6 +2973,10 @@ async def main_bot():
         if pairs_count == 0:
             logging.error("No trading pairs built")
             return
+        
+        # Initialize pair age filter
+        await pair_age_filter.initialize()
+        shutdown_handler.register_component(pair_age_filter, pair_age_filter.close)
         
         # Subscribe symbols
         for symbol in pairs_data.keys():

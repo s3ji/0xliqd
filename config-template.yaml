@@ -4,12 +4,21 @@ api_secret: ""
 discord_webhook_url: ""
 
 # Core Strategy Settings
-leverage: 10                # Trading leverage
-min_notional: 11            # Minimum trade size in USDT
+leverage: 15                # Trading leverage
+min_notional: 15            # Minimum trade size in USDT
+
+# Pair age filtering
+pair_age:
+  min_age_days: 30              # Minimum age in days before trading a pair
+  enable_age_filter: true       # Enable/disable the age filter
+  cache_duration_hours: 24      # How long to cache age data
+  api_timeout_seconds: 10       # Timeout for API requests
 
 # RapidAPI Configuration
 rapidapi:
   api_key: ""
+  base_url: "https://liquidation-report.p.rapidapi.com"
+  endpoint: "/lickhunterpro"
   update_interval_minutes: 5          # Fetch fresh data every 5 minutes
   timeout_seconds: 30                 # API request timeout
   retry_attempts: 3                   # Number of retry attempts
@@ -25,70 +34,66 @@ vwap:
   use_rapidapi_zones: true   # Use RapidAPI zones as primary signal
   vwap_enhancement: true     # Enhance with real-time VWAP
 
-# Smart DCA System
+# DCA System
 dca:
   enable: true
-  max_levels: 7              # Maximum DCA levels (user configurable)
-  
+  max_levels: 5   # Maximum DCA levels (user configurable)
+
   # DCA trigger percentages (adverse move %)
   trigger_pcts:
-    - 0.05  # DCA level 1
-    - 0.07  # DCA level 2
-    - 0.09  # DCA level 3
-    - 0.11  # DCA level 4
-    - 0.13  # DCA level 5
-    - 0.15  # DCA level 6
-    - 0.17  # DCA level 7
-  
+    - 0.04
+    - 0.07
+    - 0.10
+    - 0.13
+    - 0.16
+
   # DCA size multipliers
   size_multipliers:
-    - 2.0    # Level 1
-    - 3.0    # Level 2
-    - 4.0    # Level 3
-    - 5.0    # Level 4
-    - 6.0    # Level 5
-    - 7.0    # Level 6
-    - 8.0    # Level 7
+    - 1.5
+    - 2.0
+    - 2.5
+    - 3.0
+    - 3.5
 
 # Profit Protection System
 profit_protection:
-  initial_tp_pct: 0.00484    # Fixed TP
-  enable_stop_loss: false    # Enable SL
-  stop_loss_pct: 0.02        # Fixed SL
+  initial_tp_pct: 0.006       # Fixed TP
+  enable_stop_loss: false     # Enable SL
+  stop_loss_pct: 0.08         # Fixed SL
 
 # Market Regime Detection
 market_regime:
-  adx_period: 14
-  atr_period: 14
+  adx_period: 21
+  atr_period: 21
   trend_threshold: 25.0      # ADX above = trending market
-  range_threshold: 20.0      # ADX below = ranging market
+  range_threshold: 18.0      # ADX below = ranging market
   volatility_multiplier: 2.0 # ATR spike detection multiplier
   regime_filter: true        # Filter trades based on market regime
 
 # Momentum Detection
 momentum:
   enable_momentum_filter: true
-  
+
   # Daily thresholds
   daily_pump_threshold: 12.0    # Avoid if pumped in 24h
-  daily_dump_threshold: -12.0   # Avoid if dumped in 24h
-  
+  daily_dump_threshold: -9.0   # Avoid if dumped in 24h
+
   # Hourly thresholds  
-  hourly_pump_threshold: 5.0    # Avoid if pumped in 1h
+  hourly_pump_threshold: 6.0    # Avoid if pumped in 1h
   hourly_dump_threshold: -5.0   # Avoid if dumped in 1h
-  
+
   # Volatility limits
-  min_daily_volatility: 3.0     # Avoid if daily range
-  max_daily_volatility: 30.0    # Avoid if daily range
-  
+  min_daily_volatility: 4.0     # Avoid if daily range
+  max_daily_volatility: 45.0    # Avoid if daily range
+
   # Strategy mode
-  momentum_mode: "AVOID_EXTREMES"  # AVOID_EXTREMES, ENHANCE_SIGNALS
+  momentum_mode: "ENHANCE_SIGNALS"  # AVOID_EXTREMES, ENHANCE_SIGNALS
 
 # Risk Management
 risk:
-  isolation_pct: 1.0
+  isolation_pct: 0.35
   max_positions: 2
-  min_24h_volume: 10000000   # Minimum $10M daily volume
+  min_24h_volume: 20000000   # Minimum daily volume
 
 # System Settings
 enable_discord: true
@@ -97,8 +102,8 @@ pairs_file: "trading_pairs_auto.json"
 
 # Debug Settings
 debug:
-  enable_trade_debug: true    # Logs detailed trade info
-  enable_filter_debug: true   # Logs detailed filter info
-  enable_data_debug: true     # Logs detailed data info
-  log_all_liquidations: true  # Log all liquidation events
-  stats_interval_minutes: 60  # Stats logging interval
+  enable_trade_debug: true        # Logs detailed trade info
+  enable_filter_debug: true       # Logs detailed filter info
+  enable_data_debug: true         # Logs detailed data info
+  log_all_liquidations: true      # Log all liquidation events
+  stats_interval_minutes: 15      # Stats logging interval
