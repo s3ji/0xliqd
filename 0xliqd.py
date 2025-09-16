@@ -366,10 +366,8 @@ class PairAgeFilter:
                     for symbol_info in data.get('symbols', []):
                         if symbol_info.get('symbol') == normalize_symbol(symbol):
                             # Some symbols have baseAssetPrecision or other timing info
-                            # This is limited but we can try
                             if 'permissions' in symbol_info:
                                 # If it has SPOT and MARGIN permissions, it's likely older
-                                # This is a heuristic approach
                                 permissions = symbol_info.get('permissions', [])
                                 if len(permissions) > 1:
                                     # Assume older pairs (rough heuristic)
@@ -427,11 +425,8 @@ class PairAgeFilter:
         age_days = await self.get_pair_age_days(exchange, symbol)
         
         if age_days is None:
-            # If we can't determine age, you can choose to:
-            # Option 1: Allow trading (assume it's old enough)
-            # Option 2: Reject trading (be conservative)
-            # I'll implement Option 1 but you can change this
-            return True, "Age unknown - allowing trade"
+            # If we can't determine age, reject trading.
+            return False, "Age unknown - skipping trade"
         
         min_age = CONFIG.pair_age.min_age_days
         
