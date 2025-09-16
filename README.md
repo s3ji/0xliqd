@@ -130,72 +130,112 @@ Create `config.yaml` from the template:
 
 ```yaml
 # API Configuration
-api_key: "your_binance_api_key"
-api_secret: "your_binance_api_secret"
-discord_webhook_url: "your_discord_webhook_url"
+api_key: ""
+api_secret: ""
+discord_webhook_url: ""
 
-# Core Trading Settings
-leverage: 10                # Trading leverage (1-100)
-min_notional: 11            # Minimum trade size in USDT
-risk:
-  isolation_pct: 0.50       # Maximum % of balance to use (0.5 = 50%)
-  max_positions: 2          # Maximum concurrent positions
-  min_24h_volume: 10000000  # Minimum $10M daily volume
+# Core Strategy Settings
+leverage: 15                # Trading leverage
+min_notional: 15            # Minimum trade size in USDT
+
+# Pair age filtering
+pair_age:
+  min_age_days: 30              # Minimum age in days before trading a pair
+  enable_age_filter: true       # Enable/disable the age filter
+  cache_duration_hours: 24      # How long to cache age data
+  api_timeout_seconds: 10       # Timeout for API requests
 
 # RapidAPI Configuration
 rapidapi:
-  api_key: "your_rapidapi_key"
-  update_interval_minutes: 5
-  enable_caching: true
-  timeout_seconds: 30
-  retry_attempts: 3
+  api_key: ""
+  base_url: "https://liquidation-report.p.rapidapi.com"
+  endpoint: "/lickhunterpro"
+  update_interval_minutes: 5          # Fetch fresh data every 5 minutes
+  timeout_seconds: 30                 # API request timeout
+  retry_attempts: 3                   # Number of retry attempts
+  retry_delay: 5.0                    # Delay between retries (seconds)
+  enable_caching: true                # Cache data locally
+  cache_file: "price_zones_cache.json"
 
-# VWAP Strategy Settings
+# VWAP Configuration
 vwap:
-  period: 200               # VWAP calculation period
-  use_rapidapi_zones: true  # Use RapidAPI zones as primary
-  vwap_enhancement: true    # Blend with real-time VWAP
-  long_offset_pct: 0.8      # Long entry offset from VWAP
-  short_offset_pct: 0.8     # Short entry offset from VWAP
+  period: 200                # VWAP calculation period
+  long_offset_pct: 0.8       # Default long offset percentage
+  short_offset_pct: 0.8      # Default short offset percentage
+  use_rapidapi_zones: true   # Use RapidAPI zones as primary signal
+  vwap_enhancement: true     # Enhance with real-time VWAP
 
-# DCA Configuration
+# DCA System
 dca:
   enable: true
-  max_levels: 7
-  trigger_pcts: [0.05, 0.07, 0.09, 0.11, 0.13, 0.15, 0.17]
-  size_multipliers: [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5]
+  max_levels: 5
 
-# Profit Protection
+  trigger_pcts:
+    - 0.04
+    - 0.07
+    - 0.10
+    - 0.13
+    - 0.16
+
+  size_multipliers:
+    - 1.5
+    - 2.0
+    - 2.5
+    - 3.0
+    - 3.5
+
+# Profit Protection System
 profit_protection:
-  initial_tp_pct: 0.005     # 0.5% take profit
-  enable_stop_loss: false   # Optional stop loss
-  stop_loss_pct: 0.02       # 2% stop loss if enabled
-
-# Momentum Filtering
-momentum:
-  enable_momentum_filter: true
-  momentum_mode: "AVOID_EXTREMES"  # AVOID_EXTREMES, ENHANCE_SIGNALS
-  daily_pump_threshold: 15.0       # Avoid if >15% daily move
-  daily_dump_threshold: -10.0      # Avoid if <-10% daily move
-  hourly_pump_threshold: 8.0       # Avoid if >8% hourly move
-  hourly_dump_threshold: -6.0      # Avoid if <-6% hourly move
-  min_daily_volatility: 5.0        # Minimum daily range
-  max_daily_volatility: 50.0       # Maximum daily range
+  initial_tp_pct: 0.006       # Fixed TP
+  enable_stop_loss: false     # Enable SL
+  stop_loss_pct: 0.08         # Fixed SL
 
 # Market Regime Detection
 market_regime:
-  regime_filter: true       # Enable regime filtering
-  adx_period: 14           # ADX calculation period
-  trend_threshold: 25.0     # ADX threshold for trending markets
-  range_threshold: 20.0     # ADX threshold for ranging markets
+  adx_period: 21
+  atr_period: 21
+  trend_threshold: 25.0      # ADX above = trending market
+  range_threshold: 18.0      # ADX below = ranging market
+  volatility_multiplier: 2.0 # ATR spike detection multiplier
+  regime_filter: true        # Filter trades based on market regime
+
+# Momentum Detection
+momentum:
+  enable_momentum_filter: true
+
+  # Daily thresholds
+  daily_pump_threshold: 12.0    # Avoid if pumped in 24h
+  daily_dump_threshold: -9.0   # Avoid if dumped in 24h
+
+  # Hourly thresholds  
+  hourly_pump_threshold: 6.0    # Avoid if pumped in 1h
+  hourly_dump_threshold: -5.0   # Avoid if dumped in 1h
+
+  # Volatility limits
+  min_daily_volatility: 4.0     # Avoid if daily range
+  max_daily_volatility: 45.0    # Avoid if daily range
+
+  # Strategy mode
+  momentum_mode: "ENHANCE_SIGNALS"  # AVOID_EXTREMES, ENHANCE_SIGNALS
+
+# Risk Management
+risk:
+  isolation_pct: 0.35
+  max_positions: 2
+  min_24h_volume: 20000000   # Minimum daily volume
+
+# System Settings
+enable_discord: true
+log_file: "0xliqd.log"
+pairs_file: "trading_pairs_auto.json"
 
 # Debug Settings
 debug:
-  enable_trade_debug: true
-  enable_filter_debug: true
-  enable_data_debug: true
-  log_all_liquidations: true
-  stats_interval_minutes: 5
+  enable_trade_debug: true        # Logs detailed trade info
+  enable_filter_debug: true       # Logs detailed filter info
+  enable_data_debug: true        # Logs detailed data info
+  log_all_liquidations: true     # Log all liquidation events
+  stats_interval_minutes: 15      # Stats logging interval
 ```
 
 ---
