@@ -2538,9 +2538,9 @@ class PositionManager:
                 return False
 
     async def recover_existing_positions(self, exchange) -> int:
-        """Recover existing positions from exchange on bot startup"""
+        """Recover existing positions from exchange on bot startup - TRACKING ONLY"""
         try:
-            logging.info("🔄 Recovering existing positions from exchange...")
+            logging.info("Recovering existing positions from exchange...")
             
             # Get all active positions from exchange
             positions = await exchange.fetch_positions()
@@ -2565,7 +2565,7 @@ class PositionManager:
                     total_qty=abs(contracts),
                     avg_entry_price=entry_price,
                     total_notional_used=abs(contracts) * entry_price,
-                    dca_count=0,  # We don't know the DCA level, start from 0
+                    dca_count=0,  # Conservative: assume no DCA levels used
                     entry_time=time.time() - 3600,  # Assume 1 hour ago
                     vwap_reference=entry_price,  # Use entry price as reference
                     regime="UNKNOWN"
@@ -2575,24 +2575,17 @@ class PositionManager:
                 self.positions[symbol] = recovered_position
                 recovered_count += 1
                 
-                logging.info(f"✅ Recovered position: {symbol} {side} {abs(contracts):.6f} @ {entry_price:.6f}")
-                
-                # Try to set take profit orders for recovered positions
-                try:
-                    await profit_protection.set_initial_take_profit(exchange, recovered_position)
-                    logging.info(f"✅ Set TP for recovered position: {symbol}")
-                except Exception as tp_error:
-                    logging.warning(f"⚠️ Could not set TP for recovered position {symbol}: {tp_error}")
+                logging.info(f"Recovered position: {symbol} {side} {abs(contracts):.6f} @ {entry_price:.6f}")
             
             if recovered_count > 0:
-                logging.info(f"🎯 Successfully recovered {recovered_count} existing positions")
+                logging.info(f"Successfully recovered {recovered_count} existing positions")
             else:
-                logging.info("ℹ️ No existing positions found to recover")
+                logging.info("No existing positions found to recover")
                 
             return recovered_count
             
         except Exception as e:
-            logging.error(f"❌ Position recovery failed: {e}")
+            logging.error(f"Position recovery failed: {e}")
             return 0
     
     def get_position_count(self) -> int:
