@@ -124,9 +124,9 @@ class CompoundingConfig:
 @dataclass
 class Config:
     """Main configuration class"""
-    binance_api_key: str = ""
-    binance_api_secret: str = ""
-    binance_discord_webhook_url: str = ""
+    api_key: str = ""
+    api_secret: str = ""
+    discord_webhook_url: str = ""
     leverage: int = 10
     min_notional: float = 11.0
     rapidapi: RapidAPIConfig = field(default_factory=RapidAPIConfig)
