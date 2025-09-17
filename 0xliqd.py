@@ -2093,10 +2093,6 @@ class MomentumDetector:
             if daily_range > CONFIG.momentum.max_daily_volatility:
                 return "AVOID", f"Excessive volatility: {daily_range:.1f}%", metrics
             
-            # Prefer volume spikes (indicates institutional activity)
-            if volume_spike > 1.5:
-                return "ALLOW", f"Enhanced signal: Volume spike {volume_spike:.1f}x", metrics
-            
             return "ALLOW", f"Normal conditions: {change_24h:+.1f}% (24h)", metrics
             
         except Exception as e:
