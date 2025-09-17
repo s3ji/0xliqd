@@ -128,6 +128,7 @@ class Config:
     api_secret: str = ""
     discord_webhook_url: str = ""
     leverage: int = 10
+    margin_mode: str = "cross"
     min_notional: float = 11.0
     rapidapi: RapidAPIConfig = field(default_factory=RapidAPIConfig)
     vwap: VWAPConfig = field(default_factory=VWAPConfig)
@@ -1066,7 +1067,7 @@ class DiscordNotifier:
                     },
                     {
                         "name": "🎯 Strategy",
-                        "value": f"**Leverage:** {CONFIG.leverage}x\n**TP:** {CONFIG.profit_protection.initial_tp_pct*100:.1f}%\n**Momentum Filter:** {'ON' if CONFIG.momentum.enable_momentum_filter else 'OFF'}",
+                        "value": f"**Margin Mode:** {CONFIG.margin_mode}\n**Leverage:** {CONFIG.leverage}x\n**TP:** {CONFIG.profit_protection.initial_tp_pct*100:.1f}%\n**Momentum Filter:** {'ON' if CONFIG.momentum.enable_momentum_filter else 'OFF'}",
                         "inline": True
                     }
                 ],
@@ -3026,11 +3027,11 @@ class VWAPHunterStrategy:
             
             # Set leverage
             try:
-                await self.exchange.set_margin_mode('cross', ccxt_symbol)
+                await self.exchange.set_margin_mode(CONFIG.margin_mode, ccxt_symbol)
                 await self.exchange.set_leverage(CONFIG.leverage, ccxt_symbol)
             except Exception as e:
                 if "not modified" not in str(e).lower():
-                    logging.warning(f"Leverage setup failed: {e}")
+                    logging.warning(f"Margin Mode or Leverage setup failed: {e}")
             
             # Execute order
             order = await self.exchange.create_market_order(

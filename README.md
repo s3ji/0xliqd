@@ -9,7 +9,7 @@
 
 **Liquidation hunting bot with CCXT Pro WebSocket integration, advanced position management, and intelligent risk controls.**
 
-[Features](#-features) • [Installation](#-installation) • [Configuration](#-configuration) • [Usage](#-usage) • [Strategy](#-strategy) • [Contributing](#-contributing)
+[Features](#-features) • [Installation](#-installation) • [Configuration](#-configuration) • [Usage](#-usage) • [Strategy](#-strategy) • [Troubleshooting](#-troubleshooting) • [Contributing](#-contributing)
 
 ---
 
@@ -48,12 +48,22 @@
 - **Real-time Position Sync** - CCXT Pro position monitoring
 - **P&L Tracking** - Accurate profit/loss calculations with Discord alerts
 
+### Position Recovery
+- **Startup Position Detection** - Automatically recovers existing positions on bot restart
+- **DCA Level Tracking** - Maintains position state across restarts
+- **Crash Protection** - No lost positions due to unexpected shutdowns
+
 ### Monitoring & Analytics
 - **Comprehensive Logging** - Debug, trade, and filter logs with rotation
 - **Performance Statistics** - Real-time trading metrics and analysis
 - **Discord Integration** - Trade alerts, P&L notifications, and status updates
 - **Health Monitoring** - Connection status and automatic reconnection
 - **Enhanced Error Handling** - Graceful degradation and recovery
+
+### Enhanced Control Script
+- **Quick Reload** - Press 'r' + Enter to restart bot without full setup
+- **Auto-Recovery** - Automatic restart on unexpected crashes  
+- **Clean Shutdown** - Press 'q' + Enter or Ctrl+C for graceful exit
 
 ---
 
@@ -137,13 +147,29 @@ discord_webhook_url: ""
 # Core Strategy Settings
 leverage: 15                # Trading leverage
 min_notional: 15            # Minimum trade size in USDT
+margin_mode: "cross"        # Margin Mode: cross or isolated
+
+# Auto-compounding settings
+compounding:
+  enable_compounding: true
+  base_min_notional: 15.0         # Always use at least $15
+  compounding_percentage: 1       # Use percentage of balance as notional
 
 # Pair age filtering
 pair_age:
-  min_age_days: 30              # Minimum age in days before trading a pair
+  min_age_days: 3               # Minimum age in days before trading a pair
   enable_age_filter: true       # Enable/disable the age filter
   cache_duration_hours: 24      # How long to cache age data
   api_timeout_seconds: 10       # Timeout for API requests
+
+# Pair Filter
+pair_filter:
+  enable_whitelist: false           # Set to true to only trade whitelisted pairs
+  enable_blacklist: true            # Set to true to avoid blacklisted pairs
+  whitelist_file: "whitelist.txt"   # File containing allowed pairs
+  blacklist_file: "blacklist.txt"   # File containing blocked pairs
+  auto_reload: true                 # Auto-reload filter files
+  reload_interval_minutes: 5        # How often to reload (minutes)
 
 # RapidAPI Configuration
 rapidapi:
@@ -168,8 +194,9 @@ vwap:
 # DCA System
 dca:
   enable: true
-  max_levels: 5
+  max_levels: 5   # Maximum DCA levels (user configurable)
 
+  # DCA trigger percentages (adverse move %)
   trigger_pcts:
     - 0.04
     - 0.07
@@ -177,6 +204,7 @@ dca:
     - 0.13
     - 0.16
 
+  # DCA size multipliers
   size_multipliers:
     - 1.5
     - 2.0
@@ -186,43 +214,40 @@ dca:
 
 # Profit Protection System
 profit_protection:
-  initial_tp_pct: 0.006       # Fixed TP
-  enable_stop_loss: false     # Enable SL
-  stop_loss_pct: 0.08         # Fixed SL
+  initial_tp_pct: 0.005         # Fixed TP
+  enable_stop_loss: false       # Enable SL
+  stop_loss_pct: 0.015          # Fixed SL
 
 # Market Regime Detection
 market_regime:
   adx_period: 21
   atr_period: 21
-  trend_threshold: 25.0      # ADX above = trending market
-  range_threshold: 18.0      # ADX below = ranging market
-  volatility_multiplier: 2.0 # ATR spike detection multiplier
-  regime_filter: true        # Filter trades based on market regime
+  trend_threshold: 25.0       # ADX above = trending market
+  range_threshold: 18.0       # ADX below = ranging market
+  volatility_multiplier: 2.0  # ATR spike detection multiplier
+  regime_filter: true         # Filter trades based on market regime
 
 # Momentum Detection
 momentum:
   enable_momentum_filter: true
 
   # Daily thresholds
-  daily_pump_threshold: 12.0    # Avoid if pumped in 24h
-  daily_dump_threshold: -9.0   # Avoid if dumped in 24h
+  daily_pump_threshold: 20.0    # Avoid if pumped in 24h
+  daily_dump_threshold: -15.0   # Avoid if dumped in 24h
 
   # Hourly thresholds  
-  hourly_pump_threshold: 6.0    # Avoid if pumped in 1h
-  hourly_dump_threshold: -5.0   # Avoid if dumped in 1h
+  hourly_pump_threshold: 10.0     # Avoid if pumped in 1h
+  hourly_dump_threshold: -8.0     # Avoid if dumped in 1h
 
   # Volatility limits
-  min_daily_volatility: 4.0     # Avoid if daily range
-  max_daily_volatility: 45.0    # Avoid if daily range
-
-  # Strategy mode
-  momentum_mode: "ENHANCE_SIGNALS"  # AVOID_EXTREMES, ENHANCE_SIGNALS
+  min_daily_volatility: 2.0     # Avoid if daily range
+  max_daily_volatility: 60.0    # Avoid if daily range
 
 # Risk Management
 risk:
-  isolation_pct: 0.35
+  isolation_pct: 0.50
   max_positions: 2
-  min_24h_volume: 20000000   # Minimum daily volume
+  min_24h_volume: 15000000   # Minimum daily volume
 
 # System Settings
 enable_discord: true
@@ -233,8 +258,8 @@ pairs_file: "trading_pairs_auto.json"
 debug:
   enable_trade_debug: true        # Logs detailed trade info
   enable_filter_debug: true       # Logs detailed filter info
-  enable_data_debug: true        # Logs detailed data info
-  log_all_liquidations: true     # Log all liquidation events
+  enable_data_debug: true         # Logs detailed data info
+  log_all_liquidations: true      # Log all liquidation events
   stats_interval_minutes: 15      # Stats logging interval
 ```
 
@@ -274,7 +299,7 @@ python3 0xliqd.py
 
 ---
 
-## 📊 Strategy Overview
+## 📊 Strategy
 
 ### How It Works
 
@@ -347,9 +372,6 @@ The bot tracks comprehensive statistics:
 ### Momentum Detection
 - **Multi-timeframe Analysis**: 1h, 4h, and 24h momentum
 - **Volatility Metrics**: Range and volume spike detection
-- **Strategy Modes**: 
-  - AVOID_EXTREMES: Skip overextended moves
-  - ENHANCE_SIGNALS: Filter for quality setups
 
 ---
 
@@ -359,16 +381,26 @@ The bot tracks comprehensive statistics:
 0xliqd/
 ├── 0xliqd.py                 # Main bot application
 ├── config-template.yaml      # Configuration template
-├── config.yaml              # Your configuration (create from template)
+├── config.yaml               # Your configuration (create from template)
 ├── requirements.txt          # Python dependencies
-├── start_bot.sh             # Automated setup script
-├── README.md                # This documentation
-├── logs/                    # Log files directory
-│   ├── 0xliqd.log          # Main application log
-│   └── debug_trades.log    # Detailed trade debugging
-├── price_zones_cache.json   # Cached liquidation zones
-└── trading_pairs_auto.json # Auto-generated trading pairs
+├── start_bot.sh              # Enhanced startup script with reload
+├── README.md                 # This documentation
+├── whitelist.txt             # Allowed trading pairs (optional)
+├── blacklist.txt             # Blocked trading pairs (optional)
+├── logs/                     # Log files directory
+│   ├── 0xliqd.log            # Main application log
+│   └── debug_trades.log      # Detailed trade debugging
+├── price_zones_cache.json    # Cached liquidation zones
+└── trading_pairs_auto.json   # Auto-generated trading pairs
 ```
+
+### File Descriptions
+
+- **whitelist.txt** - Contains pairs to exclusively trade (one per line)
+- **blacklist.txt** - Contains pairs to avoid trading (one per line)
+- **start_bot.sh** - Enhanced script with reload ('r') and quit ('q') functionality
+- **price_zones_cache.json** - Cached RapidAPI liquidation data for offline use
+- **trading_pairs_auto.json** - Automatically built from exchange markets + zones
 
 ---
 
@@ -421,6 +453,36 @@ The bot tracks comprehensive statistics:
 - Automatically generates trading pairs from available zone data
 - Matches RapidAPI zones with Binance futures markets
 - Configures precision and step sizes automatically
+
+### Performance Tips
+- **Lower min_24h_volume** for more opportunities (but higher risk)
+- **Adjust momentum thresholds** based on market conditions
+- **Use appropriate isolation_pct** (50% recommended for safety)
+- **Monitor pair_age filter** - lower values = more trades, higher risk
+
+---
+
+## 🔧 Troubleshooting
+
+### Common Issues
+
+**Bot won't start:**
+- Check API keys in config.yaml
+- Ensure Python 3.8+ is installed
+- Verify RapidAPI subscription is active
+
+**No trades executing:**
+- Check momentum filter settings (might be too restrictive)
+- Verify pair age filter (min_age_days setting)
+- Check Discord for filter rejection messages
+
+**Client Order ID errors:**
+- Bot automatically handles this with shortened IDs
+- Restart bot if persistent issues occur
+
+**Position sync issues:**
+- Bot automatically recovers positions on startup
+- Check logs for recovery status messages
 
 ---
 

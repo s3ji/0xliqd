@@ -6,6 +6,7 @@ discord_webhook_url: ""
 # Core Strategy Settings
 leverage: 15                # Trading leverage
 min_notional: 15            # Minimum trade size in USDT
+margin_mode: "cross"        # Margin Mode: cross or isolated
 
 # Auto-compounding settings
 compounding:
