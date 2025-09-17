@@ -1148,8 +1148,8 @@ class DiscordNotifier:
             logging.error(f"Trade alert error for {symbol}: {e}")
     
     async def send_profit_alert(self, symbol: str, pnl_pct: float, pnl_usd: float,
-                              action: str, price: float):
-        """Send enhanced profit/loss alert"""
+                          action: str, price: float, additional_info: dict = None):
+        """Send profit/loss alert with accurate exchange data"""
         try:
             # Check rate limit
             now = time.time()
@@ -1164,22 +1164,53 @@ class DiscordNotifier:
             # Add performance context
             performance_emoji = "🚀" if pnl_pct >= 1 else "📈" if pnl_pct > 0 else "📉" if pnl_pct >= -2 else "💥"
             
+            # Action description based on exit reason
+            action_emojis = {
+                "TAKE PROFIT": "🎯 TP HIT",
+                "STOP LOSS": "🛑 SL HIT", 
+                "MANUAL CLOSE": "👤 MANUAL",
+                "POSITION CLOSED": "📤 CLOSED",
+                "LIQUIDATION": "💥 LIQUIDATED"
+            }
+            
+            enhanced_action = action_emojis.get(action, action)
+            
+            # Build the embed fields
+            fields = [
+                {
+                    "name": "💵 Results",
+                    "value": f"**P&L:** {pnl_pct:+.2f}% {performance_emoji}\n**USD:** ${pnl_usd:+.2f}",
+                    "inline": True
+                },
+                {
+                    "name": "📊 Exit Details", 
+                    "value": f"**Method:** {enhanced_action}\n**Price:** {price:.6f}\n**Time:** {datetime.now().strftime('%H:%M:%S')}",
+                    "inline": True
+                }
+            ]
+            
+            # Add additional info if provided (from position history)
+            if additional_info:
+                extra_info = []
+                if 'entry_price' in additional_info:
+                    extra_info.append(f"**Entry:** {additional_info['entry_price']:.6f}")
+                if 'quantity' in additional_info:
+                    extra_info.append(f"**Qty:** {additional_info['quantity']:.6f}")
+                if 'fees_paid' in additional_info:
+                    extra_info.append(f"**Fees:** ${additional_info['fees_paid']:.2f}")
+                
+                if extra_info:
+                    fields.append({
+                        "name": "📋 Trade Info",
+                        "value": "\n".join(extra_info),
+                        "inline": True
+                    })
+            
             embed = {
                 "title": f"{emoji} {result} • {symbol}",
-                "description": f"```{action} @ {price:.6f}```",
+                "description": f"```{enhanced_action} @ {price:.6f}```",
                 "color": color,
-                "fields": [
-                    {
-                        "name": "💵 Results",
-                        "value": f"**P&L:** {pnl_pct:+.2f}% {performance_emoji}\n**USD:** ${pnl_usd:+.2f}",
-                        "inline": True
-                    },
-                    {
-                        "name": "📊 Details",
-                        "value": f"**Exit:** {action}\n**Price:** {price:.6f}\n**Time:** {datetime.now().strftime('%H:%M:%S')}",
-                        "inline": True
-                    }
-                ],
+                "fields": fields,
                 "timestamp": datetime.utcnow().isoformat(),
                 "footer": {"text": "Powered by 0xLIQD"}
             }
@@ -1189,7 +1220,7 @@ class DiscordNotifier:
             success = await self._send_webhook(payload)
             if success:
                 self.last_sent = now
-                logging.info(f"✅ P&L alert sent: {symbol} {pnl_pct:+.2f}%")
+                logging.info(f"✅ P&L alert sent: {symbol} {pnl_pct:+.2f}% via {action}")
             else:
                 logging.warning(f"❌ Failed to send P&L alert for {symbol}")
                 
@@ -2329,13 +2360,109 @@ class PositionManager:
                 await asyncio.sleep(30)
     
     async def _handle_position_closure(self, exchange, symbol: str):
-        """Handle position closure with P&L calculation"""
+        """Handle position closure with accurate P&L from exchange data"""
         try:
             if symbol not in self.positions:
                 return
             
             position = self.positions[symbol]
+            ccxt_symbol = to_ccxt_symbol(symbol)
             
+            # Get recent position history (last 10 positions)
+            try:
+                # Binance-specific call for position history
+                position_history = await exchange.fetch_positions_history(
+                    symbols=[ccxt_symbol], 
+                    limit=10
+                )
+                
+                # Find the most recent closed position for our symbol
+                target_position = None
+                for hist_pos in position_history:
+                    if (normalize_symbol(hist_pos['symbol']) == symbol and 
+                        hist_pos['side'] == ('long' if position.side == 'buy' else 'short')):
+                        target_position = hist_pos
+                        break
+                
+                if target_position:
+                    # Extract accurate data from exchange
+                    actual_pnl_usd = float(target_position.get('realizedPnl', 0))
+                    entry_price = float(target_position.get('entryPrice', position.avg_entry_price))
+                    exit_price = float(target_position.get('markPrice', 0))  # Last known price
+                    quantity = float(target_position.get('contracts', position.total_qty))
+                    
+                    # Calculate percentage P&L
+                    if entry_price > 0:
+                        if position.side == "buy":
+                            pnl_pct = ((exit_price - entry_price) / entry_price) * 100
+                        else:
+                            pnl_pct = ((entry_price - exit_price) / entry_price) * 100
+                    else:
+                        pnl_pct = (actual_pnl_usd / position.total_notional_used) * 100
+                    
+                    # Determine exit reason from recent orders
+                    exit_reason = await self._determine_exit_reason(exchange, symbol, ccxt_symbol)
+                    
+                    # Prepare additional info for Discord
+                    additional_info = {
+                        'entry_price': entry_price,
+                        'quantity': quantity,
+                        'fees_paid': abs(float(target_position.get('fee', 0)))  # Trading fees
+                    }
+                    
+                    # Send accurate Discord notification
+                    if discord_notifier:
+                        await discord_notifier.send_profit_alert(
+                            symbol, pnl_pct, actual_pnl_usd, exit_reason, exit_price, additional_info
+                        )
+                    
+                    logging.info(f"Position closed: {symbol} | P&L: {pnl_pct:+.2f}% (${actual_pnl_usd:+.2f}) | {exit_reason}")
+                    
+                else:
+                    # Fallback to old method if history not available
+                    logging.warning(f"Could not find position history for {symbol}, using fallback P&L")
+                    await self._fallback_pnl_calculation(exchange, symbol, position)
+                    
+            except Exception as history_error:
+                logging.debug(f"Position history fetch failed for {symbol}: {history_error}")
+                # Fallback to current method
+                await self._fallback_pnl_calculation(exchange, symbol, position)
+            
+            # Remove position from tracking
+            del self.positions[symbol]
+            
+        except Exception as e:
+            logging.error(f"Failed to handle position closure for {symbol}: {e}")
+    
+    async def _determine_exit_reason(self, exchange, symbol: str, ccxt_symbol: str) -> str:
+        """Determine how the position was closed by checking recent orders"""
+        try:
+            # Get recent orders for this symbol (last 5)
+            recent_orders = await exchange.fetch_orders(ccxt_symbol, limit=5)
+            
+            # Look for recently filled exit orders
+            for order in recent_orders:
+                if (order['status'] == 'closed' and 
+                    time.time() - (order['timestamp'] / 1000) < 300):  # Within last 5 minutes
+                    
+                    client_id = order.get('clientOrderId', '')
+                    
+                    if client_id.startswith('TP-') or client_id.startswith('RTP-'):
+                        return "TAKE PROFIT"
+                    elif client_id.startswith('SL-'):
+                        return "STOP LOSS"
+                    elif order.get('reduceOnly'):
+                        return "MANUAL CLOSE"
+            
+            return "POSITION CLOSED"
+            
+        except Exception as e:
+            logging.debug(f"Could not determine exit reason for {symbol}: {e}")
+            return "POSITION CLOSED"
+
+    async def _fallback_pnl_calculation(self, exchange, symbol: str, position: Position):
+        """Fallback to original P&L calculation method"""
+        try:
             # Get current price for P&L calculation
             try:
                 ccxt_symbol = to_ccxt_symbol(symbol)
@@ -2344,7 +2471,7 @@ class PositionManager:
             except:
                 exit_price = position.avg_entry_price
             
-            # Calculate P&L
+            # Calculate P&L using original method
             if position.side == "buy":
                 pnl_pct = (exit_price - position.avg_entry_price) / position.avg_entry_price
             else:
@@ -2352,20 +2479,17 @@ class PositionManager:
             
             pnl_usd = position.total_notional_used * pnl_pct
             
-            # Send Discord notification
+            # Send Discord notification (fallback method)
             if discord_notifier:
                 await discord_notifier.send_profit_alert(
                     symbol, pnl_pct * 100, pnl_usd, "POSITION CLOSED", exit_price
                 )
             
-            # Remove position
-            del self.positions[symbol]
-            
-            logging.info(f"Position closed: {symbol} | P&L: {pnl_pct*100:+.2f}% (${pnl_usd:+.2f})")
+            logging.info(f"Position closed (fallback): {symbol} | P&L: {pnl_pct*100:+.2f}% (${pnl_usd:+.2f})")
             
         except Exception as e:
-            logging.error(f"Failed to handle position closure for {symbol}: {e}")
-    
+            logging.error(f"Fallback P&L calculation failed for {symbol}: {e}")
+
     async def create_position(self, exchange, symbol: str, side: str, liq_price: float,
                              liq_size: float, vwap_ref: float, regime: str, balance: float) -> Optional[Position]:
         """Simplified position creation"""
