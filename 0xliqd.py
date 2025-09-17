@@ -2581,10 +2581,13 @@ class ProfitProtectionSystem:
             ccxt_symbol = to_ccxt_symbol(normalized_symbol)
             exit_side = "sell" if position.side == "buy" else "buy"
             
-            # Create unique client IDs for tracking
+            # Create shorter unique client IDs (max 35 chars to be safe)
             timestamp = int(time.time() * 1000)
-            tp_client_id = f"TP-0xLIQD-{normalized_symbol}-{timestamp}"
-            sl_client_id = f"SL-0xLIQD-{normalized_symbol}-{timestamp}" if sl_price else None
+            short_symbol = normalized_symbol[:10]  # Truncate symbol to 10 chars max
+            
+            # Format: TP-SYMBOL-TIMESTAMP (keeping under 36 chars)
+            tp_client_id = f"TP-{short_symbol}-{timestamp}"[:35]
+            sl_client_id = f"SL-{short_symbol}-{timestamp}"[:35] if sl_price else None
             
             # 1. Create Take Profit Order
             tp_order = await exchange.create_limit_order(
