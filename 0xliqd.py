@@ -1921,39 +1921,27 @@ class MomentumDetector:
     async def calculate_momentum_metrics(self, exchange, symbol: str) -> Dict[str, float]:
         """Calculate various momentum and volatility metrics"""
         try:
-            # Get kline data from CCXT Pro
-            # Check if we recently fetched REST data for this symbol
-            if hasattr(self, '_rest_fetch_cache'):
-                cache_entry = self._rest_fetch_cache.get(symbol)
-                if cache_entry and time.time() - cache_entry['timestamp'] < 300:  # 5 min cache
-                    klines = cache_entry['data']
-                    logging.debug(f"Using cached REST data for {symbol}")
-                else:
-                    klines = self.data_manager.get_kline_data(symbol, limit=1440)
-            else:
-                self._rest_fetch_cache = {}
-                klines = self.data_manager.get_kline_data(symbol, limit=1440)
+            # Always try to get fresh data for accurate momentum calculation
+            klines = []
             
-            # If insufficient data from CCXT Pro, fetch from REST API
-            if len(klines) < 100:
-                logging.debug(f"Getting historical data for {symbol} via REST API")
+            # First try CCXT Pro data
+            ccxt_pro_data = self.data_manager.get_kline_data(symbol, limit=1440)
+            
+            # If CCXT Pro has insufficient data, fetch from REST API
+            if len(ccxt_pro_data) < 1000:  # Need substantial data for 24h calculation
+                logging.debug(f"CCXT Pro has {len(ccxt_pro_data)} bars, fetching REST API for {symbol}")
                 try:
                     ccxt_symbol = to_ccxt_symbol(symbol)
                     rest_klines = await exchange.fetch_ohlcv(
                         ccxt_symbol, '1m', limit=1440
                     )
-
-                    # Cache the result
-                    self._rest_fetch_cache[symbol] = {
-                        'data': rest_klines,
-                        'timestamp': time.time()
-                    }
-
                     klines = rest_klines
                     logging.debug(f"REST API provided {len(klines)} bars for {symbol}")
                 except Exception as e:
                     logging.warning(f"REST API fetch failed for {symbol}: {e}")
                     return {}
+            else:
+                klines = ccxt_pro_data
             
             # Convert to price data
             prices = []
@@ -1969,6 +1957,7 @@ class MomentumDetector:
                     volumes.append(float(kline[5]))
             
             if len(prices) < 10:
+                logging.warning(f"Insufficient price data for {symbol}: {len(prices)} bars")
                 return {}
             
             current_price = prices[-1]
@@ -1976,26 +1965,35 @@ class MomentumDetector:
             
             # 1-hour momentum
             hour_bars = min(60, len(prices) - 1)
-            if hour_bars >= 10:
+            if hour_bars >= 50:  # Need at least 50 minutes for reliable 1h calculation
                 hour_start = prices[-(hour_bars + 1)]
                 metrics['1h_change_pct'] = ((current_price - hour_start) / hour_start) * 100
             else:
                 metrics['1h_change_pct'] = 0
+                logging.warning(f"Insufficient 1h data for {symbol}: {hour_bars} bars")
             
             # 4-hour momentum
             four_hour_bars = min(240, len(prices) - 1)
-            if four_hour_bars >= 60:
+            if four_hour_bars >= 200:  # Need at least 200 minutes for reliable 4h calculation
                 four_hour_start = prices[-(four_hour_bars + 1)]
                 metrics['4h_change_pct'] = ((current_price - four_hour_start) / four_hour_start) * 100
             else:
                 metrics['4h_change_pct'] = 0
+                logging.warning(f"Insufficient 4h data for {symbol}: {four_hour_bars} bars")
             
-            # 24-hour momentum
-            if len(prices) > 1:
-                day_start = prices[0]
+            # 24-hour momentum with proper data validation
+            twenty_four_hour_bars = min(1440, len(prices) - 1)
+            if twenty_four_hour_bars >= 1200:  # Need at least 20 hours of data for reliable 24h calculation
+                day_start = prices[-(twenty_four_hour_bars + 1)]
                 metrics['24h_change_pct'] = ((current_price - day_start) / day_start) * 100
+                logging.debug(f"24h calculation for {symbol}: {twenty_four_hour_bars} bars, "
+                            f"from {day_start:.6f} to {current_price:.6f} = {metrics['24h_change_pct']:.2f}%")
             else:
-                metrics['24h_change_pct'] = 0
+                # If we don't have enough 24h data, return empty metrics
+                # This will cause the momentum filter to reject the trade
+                logging.warning(f"INSUFFICIENT 24H DATA for {symbol}: only {twenty_four_hour_bars} bars available "
+                            f"(need 1200+). Rejecting momentum calculation.")
+                return {}
             
             # Volatility metrics
             if len(highs) >= 10 and len(lows) >= 10:
@@ -2039,11 +2037,14 @@ class MomentumDetector:
                 'bars_used': len(prices)
             }
             
-            logging.debug(f"Calculated momentum for {symbol}: {metrics}")
+            # Enhanced debug logging
+            logging.info(f"MOMENTUM {symbol}: 24h={metrics.get('24h_change_pct', 0):.1f}%, "
+                        f"1h={metrics.get('1h_change_pct', 0):.1f}%, bars_used={len(prices)}")
+            
             return metrics
             
         except Exception as e:
-            logging.warning(f"Momentum calculation failed for {symbol}: {e}")
+            logging.error(f"Momentum calculation failed for {symbol}: {e}")
             return {}
     
     async def get_momentum_signal(self, exchange, symbol: str) -> Tuple[str, str, Dict]:
