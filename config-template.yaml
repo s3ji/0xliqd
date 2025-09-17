@@ -7,12 +7,27 @@ discord_webhook_url: ""
 leverage: 15                # Trading leverage
 min_notional: 15            # Minimum trade size in USDT
 
+# Auto-compounding settings
+compounding:
+  enable_compounding: true
+  base_min_notional: 15.0         # Always use at least $15
+  compounding_percentage: 1       # Use percentage of balance as notional
+
 # Pair age filtering
 pair_age:
-  min_age_days: 30              # Minimum age in days before trading a pair
+  min_age_days: 3               # Minimum age in days before trading a pair
   enable_age_filter: true       # Enable/disable the age filter
   cache_duration_hours: 24      # How long to cache age data
   api_timeout_seconds: 10       # Timeout for API requests
+
+# Pair Filter
+pair_filter:
+  enable_whitelist: false           # Set to true to only trade whitelisted pairs
+  enable_blacklist: true            # Set to true to avoid blacklisted pairs
+  whitelist_file: "whitelist.txt"   # File containing allowed pairs
+  blacklist_file: "blacklist.txt"   # File containing blocked pairs
+  auto_reload: true                 # Auto-reload filter files
+  reload_interval_minutes: 5        # How often to reload (minutes)
 
 # RapidAPI Configuration
 rapidapi:
@@ -57,9 +72,9 @@ dca:
 
 # Profit Protection System
 profit_protection:
-  initial_tp_pct: 0.006       # Fixed TP
+  initial_tp_pct: 0.005       # Fixed TP
   enable_stop_loss: false     # Enable SL
-  stop_loss_pct: 0.08         # Fixed SL
+  stop_loss_pct: 0.015         # Fixed SL
 
 # Market Regime Detection
 market_regime:
@@ -75,25 +90,22 @@ momentum:
   enable_momentum_filter: true
 
   # Daily thresholds
-  daily_pump_threshold: 12.0    # Avoid if pumped in 24h
-  daily_dump_threshold: -9.0   # Avoid if dumped in 24h
+  daily_pump_threshold: 20.0    # Avoid if pumped in 24h
+  daily_dump_threshold: -15.0   # Avoid if dumped in 24h
 
   # Hourly thresholds  
-  hourly_pump_threshold: 6.0    # Avoid if pumped in 1h
-  hourly_dump_threshold: -5.0   # Avoid if dumped in 1h
+  hourly_pump_threshold: 10.0    # Avoid if pumped in 1h
+  hourly_dump_threshold: -8.0   # Avoid if dumped in 1h
 
   # Volatility limits
-  min_daily_volatility: 4.0     # Avoid if daily range
-  max_daily_volatility: 45.0    # Avoid if daily range
-
-  # Strategy mode
-  momentum_mode: "ENHANCE_SIGNALS"  # AVOID_EXTREMES, ENHANCE_SIGNALS
+  min_daily_volatility: 2.0     # Avoid if daily range
+  max_daily_volatility: 60.0    # Avoid if daily range
 
 # Risk Management
 risk:
-  isolation_pct: 0.35
+  isolation_pct: 0.50
   max_positions: 2
-  min_24h_volume: 20000000   # Minimum daily volume
+  min_24h_volume: 15000000   # Minimum daily volume
 
 # System Settings
 enable_discord: true

@@ -95,7 +95,6 @@ class MomentumConfig:
     hourly_dump_threshold: float = -6.0
     min_daily_volatility: float = 5.0
     max_daily_volatility: float = 50.0
-    momentum_mode: str = "AVOID_EXTREMES"
 
 @dataclass
 class PairAgeConfig:
@@ -106,11 +105,28 @@ class PairAgeConfig:
     api_timeout_seconds: int = 10
 
 @dataclass
+class PairFilterConfig:
+    """Configuration for pair whitelist/blacklist filtering"""
+    enable_whitelist: bool = False
+    enable_blacklist: bool = False
+    whitelist_file: str = "whitelist.txt"
+    blacklist_file: str = "blacklist.txt"
+    auto_reload: bool = True
+    reload_interval_minutes: int = 5
+
+@dataclass
+class CompoundingConfig:
+    """Auto-compounding configuration"""
+    enable_compounding: bool = False
+    base_min_notional: float = 15.0         # Always use at least this amount
+    compounding_percentage: float = 0.02    # Use 2% of total balance
+
+@dataclass
 class Config:
     """Main configuration class"""
-    api_key: str = ""
-    api_secret: str = ""
-    discord_webhook_url: str = ""
+    binance_api_key: str = ""
+    binance_api_secret: str = ""
+    binance_discord_webhook_url: str = ""
     leverage: int = 10
     min_notional: float = 11.0
     rapidapi: RapidAPIConfig = field(default_factory=RapidAPIConfig)
@@ -122,6 +138,8 @@ class Config:
     debug: DebugConfig = field(default_factory=DebugConfig)
     momentum: MomentumConfig = field(default_factory=MomentumConfig)
     pair_age: PairAgeConfig = field(default_factory=PairAgeConfig)
+    pair_filter: PairFilterConfig = field(default_factory=PairFilterConfig)
+    compounding: CompoundingConfig = field(default_factory=CompoundingConfig)
     enable_discord: bool = True
     log_file: str = "0xliqd.log"
     pairs_file: str = "trading_pairs_auto.json"
@@ -139,11 +157,11 @@ def load_config() -> Config:
                 for key, value in file_config.items():
                     if hasattr(config, key) and not isinstance(getattr(config, key),
                         (RapidAPIConfig, VWAPConfig, DCAConfig, ProfitProtectionConfig, 
-                         MarketRegimeConfig, RiskConfig, DebugConfig, MomentumConfig, PairAgeConfig)):
+                         MarketRegimeConfig, RiskConfig, DebugConfig, MomentumConfig, PairAgeConfig, PairFilterConfig, CompoundingConfig)):
                         setattr(config, key, value)
                 
                 for sub_config_name in ['rapidapi', 'vwap', 'dca', 'profit_protection', 
-                                       'market_regime', 'risk', 'debug', 'momentum', 'pair_age']:
+                                       'market_regime', 'risk', 'debug', 'momentum', 'pair_age', 'pair_filter', 'compounding']:
                     if sub_config_name in file_config:
                         sub_config = getattr(config, sub_config_name)
                         for key, value in file_config[sub_config_name].items():
@@ -444,6 +462,173 @@ class PairAgeFilter:
 pair_age_filter = PairAgeFilter()
 
 # =============================================================================
+# PAIR FILTER MANAGER
+# =============================================================================
+
+class PairFilterManager:
+    """Manages whitelist and blacklist for trading pairs"""
+    
+    def __init__(self, config: PairFilterConfig):
+        self.config = config
+        self.whitelist: set = set()
+        self.blacklist: set = set()
+        self.last_reload = 0
+        self.reload_task: Optional[asyncio.Task] = None
+        
+    async def initialize(self):
+        """Initialize the filter manager"""
+        await self.load_filters()
+        
+        if self.config.auto_reload:
+            self.reload_task = asyncio.create_task(self._auto_reload_loop())
+            logging.info("Pair filter auto-reload enabled")
+    
+    async def load_filters(self):
+        """Load whitelist and blacklist from files"""
+        try:
+            # Load whitelist
+            if self.config.enable_whitelist:
+                self.whitelist = await self._load_pairs_from_file(self.config.whitelist_file)
+                logging.info(f"Loaded whitelist: {len(self.whitelist)} pairs")
+                if self.whitelist:
+                    logging.info(f"Whitelist samples: {list(self.whitelist)[:5]}")
+            
+            # Load blacklist
+            if self.config.enable_blacklist:
+                self.blacklist = await self._load_pairs_from_file(self.config.blacklist_file)
+                logging.info(f"Loaded blacklist: {len(self.blacklist)} pairs")
+                if self.blacklist:
+                    logging.info(f"Blacklist samples: {list(self.blacklist)[:5]}")
+            
+            self.last_reload = time.time()
+            
+        except Exception as e:
+            logging.error(f"Failed to load pair filters: {e}")
+    
+    async def _load_pairs_from_file(self, filename: str) -> set:
+        """Load pairs from a text file"""
+        pairs = set()
+        
+        try:
+            if Path(filename).exists():
+                with open(filename, 'r') as f:
+                    for line in f:
+                        line = line.strip().upper()
+                        if line and not line.startswith('#'):
+                            # Normalize the symbol
+                            normalized = normalize_symbol(line)
+                            if normalized:
+                                pairs.add(normalized)
+            else:
+                # Create example file
+                await self._create_example_file(filename)
+                
+        except Exception as e:
+            logging.error(f"Error loading pairs from {filename}: {e}")
+        
+        return pairs
+    
+    async def _create_example_file(self, filename: str):
+        """Create an example filter file"""
+        try:
+            example_content = """# Pair Filter File
+# Add one symbol per line (case insensitive)
+# Lines starting with # are comments
+# 
+# Examples:
+# BTCUSDT
+# ETHUSDT
+# ADAUSDT
+# SOLUSDT
+# DOGEUSDT
+#
+# You can use different formats:
+# BTC/USDT (will be converted to BTCUSDT)
+# BTC/USDT:USDT (will be converted to BTCUSDT)
+# 
+# Add your pairs below:
+
+"""
+            with open(filename, 'w') as f:
+                f.write(example_content)
+            logging.info(f"Created example filter file: {filename}")
+        except Exception as e:
+            logging.error(f"Failed to create example file {filename}: {e}")
+    
+    async def _auto_reload_loop(self):
+        """Auto-reload filters periodically"""
+        while True:
+            try:
+                await asyncio.sleep(self.config.reload_interval_minutes * 60)
+                old_whitelist_count = len(self.whitelist)
+                old_blacklist_count = len(self.blacklist)
+                
+                await self.load_filters()
+                
+                # Log changes
+                if self.config.enable_whitelist and len(self.whitelist) != old_whitelist_count:
+                    logging.info(f"Whitelist updated: {old_whitelist_count} -> {len(self.whitelist)} pairs")
+                
+                if self.config.enable_blacklist and len(self.blacklist) != old_blacklist_count:
+                    logging.info(f"Blacklist updated: {old_blacklist_count} -> {len(self.blacklist)} pairs")
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.error(f"Auto-reload error: {e}")
+                await asyncio.sleep(60)
+    
+    def should_trade_pair(self, symbol: str) -> tuple[bool, str]:
+        """Check if pair should be traded based on filters"""
+        normalized_symbol = normalize_symbol(symbol)
+        
+        # Whitelist check (if enabled)
+        if self.config.enable_whitelist:
+            if normalized_symbol not in self.whitelist:
+                return False, f"Not in whitelist ({len(self.whitelist)} allowed pairs)"
+        
+        # Blacklist check (if enabled)
+        if self.config.enable_blacklist:
+            if normalized_symbol in self.blacklist:
+                return False, f"In blacklist ({len(self.blacklist)} blocked pairs)"
+        
+        # Determine which filters are active
+        active_filters = []
+        if self.config.enable_whitelist:
+            active_filters.append("whitelist")
+        if self.config.enable_blacklist:
+            active_filters.append("blacklist")
+        
+        if active_filters:
+            return True, f"Passed {'/'.join(active_filters)} filter"
+        else:
+            return True, "No filters enabled"
+    
+    def get_filter_stats(self) -> dict:
+        """Get current filter statistics"""
+        return {
+            'whitelist_enabled': self.config.enable_whitelist,
+            'blacklist_enabled': self.config.enable_blacklist,
+            'whitelist_count': len(self.whitelist),
+            'blacklist_count': len(self.blacklist),
+            'last_reload_minutes': (time.time() - self.last_reload) / 60,
+            'auto_reload': self.config.auto_reload
+        }
+    
+    async def close(self):
+        """Clean shutdown"""
+        if self.reload_task:
+            self.reload_task.cancel()
+            try:
+                await self.reload_task
+            except asyncio.CancelledError:
+                pass
+        logging.info("Pair filter manager closed")
+
+# Global instance
+pair_filter_manager: Optional[PairFilterManager] = None
+
+# =============================================================================
 # STATISTICS TRACKING
 # =============================================================================
 
@@ -465,6 +650,8 @@ class TradingStatistics:
             'volume_filter': 0,
             'momentum_filter': 0,
             'pair_age_filter': 0,
+            'whitelist_filter': 0,
+            'blacklist_filter': 0,
             'no_zones': 0,
             'old_data': 0,
             'invalid_vwap': 0,
@@ -848,6 +1035,19 @@ class DiscordNotifier:
             if now - self.last_sent < self.rate_limit:
                 logging.debug("Discord startup alert rate limited")
                 return
+
+            # Get filter stats
+            filter_info = ""
+            global pair_filter_manager
+            if pair_filter_manager:
+                stats = pair_filter_manager.get_filter_stats()
+                if stats['whitelist_enabled'] or stats['blacklist_enabled']:
+                    filter_parts = []
+                    if stats['whitelist_enabled']:
+                        filter_parts.append(f"Whitelist: {stats['whitelist_count']}")
+                    if stats['blacklist_enabled']:
+                        filter_parts.append(f"Blacklist: {stats['blacklist_count']}")
+                    filter_info = f"\n**Filters:** {' | '.join(filter_parts)}"
             
             embed = {
                 "title": "⚡ 0xLIQD - ACTIVE",
@@ -861,7 +1061,7 @@ class DiscordNotifier:
                     },
                     {
                         "name": "🔧 Data Status",
-                        "value": f"**Zones:** {zones_count}\n**Pairs:** {pairs_count}\n**Max Positions:** {CONFIG.risk.max_positions}",
+                        "value": f"**Zones:** {zones_count}\n**Pairs:** {pairs_count}\n**Max Positions:** {CONFIG.risk.max_positions}{filter_info}",
                         "inline": True
                     },
                     {
@@ -1718,15 +1918,42 @@ class MomentumDetector:
         self.data_manager = data_manager
         self.momentum_cache: Dict[str, Dict] = {}
     
-    def calculate_momentum_metrics(self, symbol: str) -> Dict[str, float]:
+    async def calculate_momentum_metrics(self, exchange, symbol: str) -> Dict[str, float]:
         """Calculate various momentum and volatility metrics"""
         try:
             # Get kline data from CCXT Pro
-            klines = self.data_manager.get_kline_data(symbol, limit=1440)
+            # Check if we recently fetched REST data for this symbol
+            if hasattr(self, '_rest_fetch_cache'):
+                cache_entry = self._rest_fetch_cache.get(symbol)
+                if cache_entry and time.time() - cache_entry['timestamp'] < 300:  # 5 min cache
+                    klines = cache_entry['data']
+                    logging.debug(f"Using cached REST data for {symbol}")
+                else:
+                    klines = self.data_manager.get_kline_data(symbol, limit=1440)
+            else:
+                self._rest_fetch_cache = {}
+                klines = self.data_manager.get_kline_data(symbol, limit=1440)
             
-            if len(klines) < 10:
-                logging.debug(f"Not enough kline data for {symbol}: {len(klines)} bars")
-                return {}
+            # If insufficient data from CCXT Pro, fetch from REST API
+            if len(klines) < 100:
+                logging.debug(f"Getting historical data for {symbol} via REST API")
+                try:
+                    ccxt_symbol = to_ccxt_symbol(symbol)
+                    rest_klines = await exchange.fetch_ohlcv(
+                        ccxt_symbol, '1m', limit=1440
+                    )
+
+                    # Cache the result
+                    self._rest_fetch_cache[symbol] = {
+                        'data': rest_klines,
+                        'timestamp': time.time()
+                    }
+
+                    klines = rest_klines
+                    logging.debug(f"REST API provided {len(klines)} bars for {symbol}")
+                except Exception as e:
+                    logging.warning(f"REST API fetch failed for {symbol}: {e}")
+                    return {}
             
             # Convert to price data
             prices = []
@@ -1819,7 +2046,7 @@ class MomentumDetector:
             logging.warning(f"Momentum calculation failed for {symbol}: {e}")
             return {}
     
-    def get_momentum_signal(self, symbol: str) -> Tuple[str, str, Dict]:
+    async def get_momentum_signal(self, exchange, symbol: str) -> Tuple[str, str, Dict]:
         """Get momentum signal for a symbol"""
         try:
             # First ensure we have data by subscribing
@@ -1830,10 +2057,10 @@ class MomentumDetector:
             if cached and time.time() - cached['timestamp'] < 300:
                 metrics = cached['metrics']
             else:
-                metrics = self.calculate_momentum_metrics(symbol)
+                metrics = await self.calculate_momentum_metrics(exchange, symbol)
             
             if not metrics:
-                return "ALLOW", "No momentum data", {}
+                return "AVOID", "No momentum data", {}
             
             # Extract key metrics with defaults
             change_1h = metrics.get('1h_change_pct', 0)
@@ -1841,54 +2068,40 @@ class MomentumDetector:
             change_24h = metrics.get('24h_change_pct', 0)
             daily_range = metrics.get('daily_range_pct', 10)
             volume_spike = metrics.get('volume_spike_ratio', 1)
-            
-            # Apply strategy based on mode
-            mode = CONFIG.momentum.momentum_mode
-            
-            if mode == "AVOID_EXTREMES":
-                # Avoid entering positions on extreme moves
-                if change_24h >= CONFIG.momentum.daily_pump_threshold:
-                    return "AVOID", f"Over-pumped: +{change_24h:.1f}% (24h)", metrics
-                elif change_24h <= CONFIG.momentum.daily_dump_threshold:
-                    return "AVOID", f"Over-dumped: {change_24h:.1f}% (24h)", metrics
-                elif change_1h >= CONFIG.momentum.hourly_pump_threshold:
-                    return "AVOID", f"Recent pump: +{change_1h:.1f}% (1h)", metrics
-                elif change_1h <= CONFIG.momentum.hourly_dump_threshold:
-                    return "AVOID", f"Recent dump: {change_1h:.1f}% (1h)", metrics
-                elif daily_range >= CONFIG.momentum.max_daily_volatility:
-                    return "AVOID", f"Excessive volatility: {daily_range:.1f}%", metrics
-                elif daily_range <= CONFIG.momentum.min_daily_volatility and daily_range > 0:
-                    return "AVOID", f"Low volatility: {daily_range:.1f}%", metrics
-                else:
-                    return "ALLOW", f"Normal momentum: {change_24h:+.1f}% (24h), {change_1h:+.1f}% (1h), range: {daily_range:.1f}%", metrics
-            
-            if mode == "ENHANCE_SIGNALS":
-                # Avoid recent extremes (reduces false signals)
-                if abs(change_1h) >= CONFIG.momentum.hourly_pump_threshold:
-                    return "AVOID", f"Recent extreme move: {change_1h:+.1f}% (1h)", metrics
-                
-                if abs(change_24h) >= CONFIG.momentum.daily_pump_threshold:
-                    return "AVOID", f"Daily extreme: {change_24h:+.1f}% (24h)", metrics
-                
-                # Require minimum volatility (ensures movement potential)
-                if daily_range < CONFIG.momentum.min_daily_volatility:
-                    return "AVOID", f"Low volatility: {daily_range:.1f}%", metrics
-                
-                # Avoid excessive volatility (reduces unpredictable moves)
-                if daily_range > CONFIG.momentum.max_daily_volatility:
-                    return "AVOID", f"Excessive volatility: {daily_range:.1f}%", metrics
-                
-                # Prefer volume spikes (indicates institutional activity)
-                if volume_spike > 1.5:
-                    return "ALLOW", f"Enhanced signal: Volume spike {volume_spike:.1f}x", metrics
-                
-                return "ALLOW", f"Normal conditions: {change_24h:+.1f}% (24h)", metrics
 
-            return "ALLOW", "Default allow", metrics
+            # Avoid recent pumps (positive moves beyond threshold)
+            if change_1h > CONFIG.momentum.hourly_pump_threshold:
+                return "AVOID", f"Recent pump: {change_1h:+.1f}% (1h)", metrics
+
+            # Avoid recent dumps (negative moves beyond threshold)
+            if change_1h < CONFIG.momentum.hourly_dump_threshold:
+                return "AVOID", f"Recent dump: {change_1h:+.1f}% (1h)", metrics
+            
+            # Avoid daily pumps
+            if change_24h > CONFIG.momentum.daily_pump_threshold:
+                return "AVOID", f"Daily pump: {change_24h:+.1f}% (24h)", metrics
+
+            # Avoid daily dumps
+            if change_24h < CONFIG.momentum.daily_dump_threshold:
+                return "AVOID", f"Daily dump: {change_24h:+.1f}% (24h)", metrics
+            
+            # Require minimum volatility (ensures movement potential)
+            if daily_range < CONFIG.momentum.min_daily_volatility:
+                return "AVOID", f"Low volatility: {daily_range:.1f}%", metrics
+            
+            # Avoid excessive volatility (reduces unpredictable moves)
+            if daily_range > CONFIG.momentum.max_daily_volatility:
+                return "AVOID", f"Excessive volatility: {daily_range:.1f}%", metrics
+            
+            # Prefer volume spikes (indicates institutional activity)
+            if volume_spike > 1.5:
+                return "ALLOW", f"Enhanced signal: Volume spike {volume_spike:.1f}x", metrics
+            
+            return "ALLOW", f"Normal conditions: {change_24h:+.1f}% (24h)", metrics
             
         except Exception as e:
             logging.error(f"Momentum signal error for {symbol}: {e}")
-            return "ALLOW", "Error in momentum calculation", {}
+            return "AVOID", "Error in momentum calculation", {}
 
 # =============================================================================
 # MARKET REGIME DETECTOR
@@ -2028,11 +2241,29 @@ class PositionManager:
         self._position_locks: Dict[str, asyncio.Lock] = {}
         self.recent_attempts: Dict[str, float] = {}
         self.attempt_cooldown = 10
+        self.current_notional = CONFIG.min_notional
         
         # Simplified monitoring
         self.order_monitoring_task: Optional[asyncio.Task] = None
         self.is_monitoring_orders = False
     
+    def calculate_position_notional(self, balance: float) -> float:
+        """Calculate position size with compounding"""
+        if not CONFIG.compounding.enable_compounding:
+            return CONFIG.min_notional
+        
+        # Calculate compounded size
+        compounded_size = balance * CONFIG.compounding.compounding_percentage
+        
+        # Ensure minimum and maximum bounds
+        position_size = max(
+            CONFIG.compounding.base_min_notional,   # Never below base minimum
+            compounded_size                         # Cap maximum
+        )
+        
+        logging.debug(f"Position sizing: Balance=${balance:.2f}, Compounded=${compounded_size:.2f}, Final=${position_size:.2f}")
+        return position_size
+
     def get_position_lock(self, symbol: str) -> asyncio.Lock:
         """Get lock for symbol"""
         normalized = normalize_symbol(symbol)
@@ -2183,7 +2414,7 @@ class PositionManager:
                 return None
             
             # Calculate position size
-            entry_notional = CONFIG.min_notional
+            entry_notional = self.calculate_position_notional(balance)
             entry_qty = entry_notional / liq_price
             
             # Apply quantity rounding
@@ -2262,7 +2493,8 @@ class PositionManager:
             if dca_level - 1 < len(CONFIG.dca.size_multipliers):
                 size_multiplier = CONFIG.dca.size_multipliers[dca_level - 1]
             
-            dca_notional = CONFIG.min_notional * size_multiplier
+            balance = await get_account_balance(exchange)
+            dca_notional = self.calculate_position_notional(balance) * size_multiplier  
             dca_qty = dca_notional / current_price
             
             # Apply rounding
@@ -2635,6 +2867,18 @@ class VWAPHunterStrategy:
             if not pairs_builder.is_pair_enabled(normalized_symbol):
                 stats.log_filter_rejection('pair_not_enabled')
                 return
+
+            global pair_filter_manager
+            if pair_filter_manager:
+                filter_pass, filter_reason = pair_filter_manager.should_trade_pair(normalized_symbol)
+                if not filter_pass:
+                    if "whitelist" in filter_reason.lower():
+                        stats.log_filter_rejection('whitelist_filter')
+                    elif "blacklist" in filter_reason.lower():
+                        stats.log_filter_rejection('blacklist_filter')
+                    if CONFIG.debug.enable_filter_debug:
+                        logging.info(f"PAIR FILTER REJECT: {normalized_symbol} - {filter_reason}")
+                    return
             
             # Age filter check
             age_pass, age_reason = await pair_age_filter.should_trade_pair(self.exchange, normalized_symbol)
@@ -2651,9 +2895,12 @@ class VWAPHunterStrategy:
             
             # Momentum filter
             if CONFIG.momentum.enable_momentum_filter and self.momentum_detector:
-                signal, reason, _ = self.momentum_detector.get_momentum_signal(normalized_symbol)
+                signal, reason, metrics = await self.momentum_detector.get_momentum_signal(self.exchange, normalized_symbol)
+
                 if signal == "AVOID":
                     stats.log_filter_rejection('momentum_filter')
+                    if CONFIG.debug.enable_filter_debug:
+                        logging.info(f"MOMENTUM FILTER REJECT: {normalized_symbol} - {reason}")
                     return
             
             # Zones check
@@ -2932,7 +3179,7 @@ async def main_bot():
     setup_enhanced_logging()
     logging.info("0xLIQD - STARTING UP...")
     
-    global data_manager
+    global data_manager, pair_filter_manager
     shutdown_handler.setup_signal_handlers()
     
     try:
@@ -2950,6 +3197,7 @@ async def main_bot():
         data_manager = CCXTProDataManager(exchange)
         shutdown_handler.register_component(data_manager, data_manager.close)
         await data_manager.start_streaming()
+        await asyncio.sleep(3)
         
         # Initialize zones client
         await rapidapi_client.initialize()
@@ -2972,6 +3220,12 @@ async def main_bot():
         # Initialize pair age filter
         await pair_age_filter.initialize()
         shutdown_handler.register_component(pair_age_filter, pair_age_filter.close)
+
+        # Initialize pair filter
+        global pair_filter_manager
+        pair_filter_manager = PairFilterManager(CONFIG.pair_filter)
+        await pair_filter_manager.initialize()
+        shutdown_handler.register_component(pair_filter_manager, pair_filter_manager.close)
         
         # Subscribe symbols
         for symbol in pairs_data.keys():
@@ -2996,6 +3250,12 @@ async def main_bot():
             await discord_notifier.send_startup_alert(zones_count, pairs_count)
         
         logging.info(f"Configuration: {CONFIG.risk.max_positions} max positions")
+
+        # LOG FILTER STATISTICS
+        if pair_filter_manager:
+            filter_stats = pair_filter_manager.get_filter_stats()
+            logging.info(f"Pair Filters: Whitelist: {filter_stats['whitelist_enabled']} ({filter_stats['whitelist_count']} pairs), "
+                        f"Blacklist: {filter_stats['blacklist_enabled']} ({filter_stats['blacklist_count']} pairs)")
         
         # Main liquidation stream (SIMPLIFIED VERSION)
         await run_liquidation_stream_with_shutdown(strategy)
