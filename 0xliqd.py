@@ -2536,6 +2536,64 @@ class PositionManager:
                 logging.error(f"DCA execution failed for {normalized_symbol}: {e}")
                 stats.log_dca_attempt(False)
                 return False
+
+    async def recover_existing_positions(self, exchange) -> int:
+        """Recover existing positions from exchange on bot startup"""
+        try:
+            logging.info("🔄 Recovering existing positions from exchange...")
+            
+            # Get all active positions from exchange
+            positions = await exchange.fetch_positions()
+            recovered_count = 0
+            
+            for pos in positions:
+                contracts = float(pos.get('contracts', 0))
+                if contracts == 0:  # Skip empty positions
+                    continue
+                    
+                symbol = normalize_symbol(pos['symbol'])
+                side = 'buy' if pos['side'] == 'long' else 'sell'
+                entry_price = float(pos.get('entryPrice', 0))
+                
+                if entry_price <= 0:
+                    continue
+                    
+                # Create a position object with recovered data
+                recovered_position = Position(
+                    symbol=symbol,
+                    side=side,
+                    total_qty=abs(contracts),
+                    avg_entry_price=entry_price,
+                    total_notional_used=abs(contracts) * entry_price,
+                    dca_count=0,  # We don't know the DCA level, start from 0
+                    entry_time=time.time() - 3600,  # Assume 1 hour ago
+                    vwap_reference=entry_price,  # Use entry price as reference
+                    regime="UNKNOWN"
+                )
+                
+                # Add to our tracking
+                self.positions[symbol] = recovered_position
+                recovered_count += 1
+                
+                logging.info(f"✅ Recovered position: {symbol} {side} {abs(contracts):.6f} @ {entry_price:.6f}")
+                
+                # Try to set take profit orders for recovered positions
+                try:
+                    await profit_protection.set_initial_take_profit(exchange, recovered_position)
+                    logging.info(f"✅ Set TP for recovered position: {symbol}")
+                except Exception as tp_error:
+                    logging.warning(f"⚠️ Could not set TP for recovered position {symbol}: {tp_error}")
+            
+            if recovered_count > 0:
+                logging.info(f"🎯 Successfully recovered {recovered_count} existing positions")
+            else:
+                logging.info("ℹ️ No existing positions found to recover")
+                
+            return recovered_count
+            
+        except Exception as e:
+            logging.error(f"❌ Position recovery failed: {e}")
+            return 0
     
     def get_position_count(self) -> int:
         return len(self.positions)
@@ -3236,6 +3294,11 @@ async def main_bot():
         # Initialize strategy
         strategy = VWAPHunterStrategy(exchange)
         
+        # RECOVER EXISTING POSITIONS ON STARTUP
+        recovered_positions = await position_manager.recover_existing_positions(exchange)
+        if recovered_positions > 0:
+            logging.info(f"🎯 Bot restarted with {recovered_positions} existing positions")
+
         # Start monitoring
         await position_manager.start_order_monitoring(exchange)
         shutdown_handler.register_component(position_manager, position_manager.stop_order_monitoring)
