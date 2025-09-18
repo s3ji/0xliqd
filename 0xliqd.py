@@ -1904,36 +1904,68 @@ class EnhancedVWAPCalculator:
             return 0
     
     def get_vwap_levels(self, symbol: str, current_price: float) -> Tuple[float, float, float]:
-        """Get VWAP levels combining price zones and real-time VWAP"""
-        # Get price zones
-        long_zone, short_zone, mean_volume = rapidapi_client.get_zones(symbol)
+        """Get VWAP levels - API provides pre-calculated entry prices"""
         
-        # Primary logic: Use RapidAPI zones if available
-        if CONFIG.vwap.use_rapidapi_zones and long_zone > 0 and short_zone > 0:
-            final_long_level = long_zone
-            final_short_level = short_zone
-            vwap_reference = (long_zone + short_zone) / 2
+        # Get pre-calculated entry prices from RapidAPI
+        api_long_entry_price, api_short_entry_price, mean_volume = rapidapi_client.get_zones(symbol)
+        
+        final_long_level = 0
+        final_short_level = 0
+        vwap_reference = current_price
+        
+        if CONFIG.vwap.use_rapidapi_zones and api_long_entry_price > 0 and api_short_entry_price > 0:
+            # Use API prices directly
+            final_long_level = api_long_entry_price
+            final_short_level = api_short_entry_price
+            
+            # Reference VWAP is estimated as midpoint
+            vwap_reference = (api_long_entry_price + api_short_entry_price) / 2
+            
+            # Optional: Blend with real-time VWAP if enhancement is enabled
+            if CONFIG.vwap.vwap_enhancement:
+                cached_vwap = self.vwap_cache.get(symbol)
+                if cached_vwap and time.time() - cached_vwap['timestamp'] < 300:
+                    rt_vwap = cached_vwap['vwap']
+                    
+                    # Create RT VWAP entry levels using the SAME offset logic as API
+                    rt_long_level = rt_vwap * (1 - CONFIG.vwap.long_offset_pct / 100)
+                    rt_short_level = rt_vwap * (1 + CONFIG.vwap.short_offset_pct / 100)
+                    
+                    # Blend the entry levels
+                    final_long_level = final_long_level * 0.7 + rt_long_level * 0.3
+                    final_short_level = final_short_level * 0.7 + rt_short_level * 0.3
+                    
+                    # Update reference
+                    vwap_reference = (vwap_reference * 0.7) + (rt_vwap * 0.3)
+            
+            logging.debug(f"API ENTRY LEVELS {symbol}: Long={api_long_entry_price:.6f}, Short={api_short_entry_price:.6f}")
+            
         else:
-            # Fallback: Use real-time VWAP with offsets
+            # Fallback: Calculate our own entry levels from real-time VWAP
             cached_vwap = self.vwap_cache.get(symbol)
             if cached_vwap and time.time() - cached_vwap['timestamp'] < 300:
                 vwap_reference = cached_vwap['vwap']
             else:
                 vwap_reference = current_price
+                logging.warning(f"Using current price as VWAP fallback for {symbol}")
             
+            # Apply the same offset logic as the API would
             final_long_level = vwap_reference * (1 - CONFIG.vwap.long_offset_pct / 100)
             final_short_level = vwap_reference * (1 + CONFIG.vwap.short_offset_pct / 100)
         
-        # Blend with real-time VWAP if enabled
-        if CONFIG.vwap.vwap_enhancement and long_zone > 0 and short_zone > 0:
-            cached_vwap = self.vwap_cache.get(symbol)
-            if cached_vwap:
-                rt_vwap = cached_vwap['vwap']
-                rt_long = rt_vwap * (1 - CONFIG.vwap.long_offset_pct / 100)
-                rt_short = rt_vwap * (1 + CONFIG.vwap.short_offset_pct / 100)
-                
-                final_long_level = final_long_level * 0.7 + rt_long * 0.3
-                final_short_level = final_short_level * 0.7 + rt_short * 0.3
+        # Basic validation
+        if final_long_level <= 0 or final_short_level <= 0:
+            logging.error(f"Invalid final levels for {symbol}")
+            return 0, 0, vwap_reference
+        
+        # Log with corrected understanding
+        long_discount_pct = ((vwap_reference - final_long_level) / vwap_reference) * 100
+        short_premium_pct = ((final_short_level - vwap_reference) / vwap_reference) * 100
+        
+        logging.debug(f"ENTRY LEVELS {symbol}: "
+                    f"Long={final_long_level:.6f} ({long_discount_pct:.1f}% discount), "
+                    f"Short={final_short_level:.6f} ({short_premium_pct:.1f}% premium), "
+                    f"Est.VWAP={vwap_reference:.6f}")
         
         return final_long_level, final_short_level, vwap_reference
 
