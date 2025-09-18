@@ -1951,114 +1951,143 @@ class MomentumDetector:
         self.momentum_cache: Dict[str, Dict] = {}
     
     async def calculate_momentum_metrics(self, exchange, symbol: str) -> Dict[str, float]:
-        """Calculate various momentum and volatility metrics"""
+        """Calculate various momentum and volatility metrics using exchange-aligned methods"""
         try:
-            # Always try to get fresh data for accurate momentum calculation
-            klines = []
-            
-            # First try CCXT Pro data
-            ccxt_pro_data = self.data_manager.get_kline_data(symbol, limit=1440)
-            
-            # If CCXT Pro has insufficient data, fetch from REST API
-            if len(ccxt_pro_data) < 1000:  # Need substantial data for 24h calculation
-                logging.debug(f"CCXT Pro has {len(ccxt_pro_data)} bars, fetching REST API for {symbol}")
-                try:
-                    ccxt_symbol = to_ccxt_symbol(symbol)
-                    rest_klines = await exchange.fetch_ohlcv(
-                        ccxt_symbol, '1m', limit=1440
-                    )
-                    klines = rest_klines
-                    logging.debug(f"REST API provided {len(klines)} bars for {symbol}")
-                except Exception as e:
-                    logging.warning(f"REST API fetch failed for {symbol}: {e}")
-                    return {}
-            else:
-                klines = ccxt_pro_data
-            
-            # Convert to price data
-            prices = []
-            highs = []
-            lows = []
-            volumes = []
-            
-            for kline in klines:
-                if len(kline) >= 6:
-                    prices.append(float(kline[4]))
-                    highs.append(float(kline[2]))
-                    lows.append(float(kline[3]))
-                    volumes.append(float(kline[5]))
-            
-            if len(prices) < 10:
-                logging.warning(f"Insufficient price data for {symbol}: {len(prices)} bars")
-                return {}
-            
-            current_price = prices[-1]
+            ccxt_symbol = to_ccxt_symbol(symbol)
+            current_price = 0
             metrics = {}
             
-            # 1-hour momentum
-            hour_bars = min(60, len(prices) - 1)
-            if hour_bars >= 50:  # Need at least 50 minutes for reliable 1h calculation
-                hour_start = prices[-(hour_bars + 1)]
-                metrics['1h_change_pct'] = ((current_price - hour_start) / hour_start) * 100
-            else:
-                metrics['1h_change_pct'] = 0
-                logging.warning(f"Insufficient 1h data for {symbol}: {hour_bars} bars")
-            
-            # 4-hour momentum
-            four_hour_bars = min(240, len(prices) - 1)
-            if four_hour_bars >= 200:  # Need at least 200 minutes for reliable 4h calculation
-                four_hour_start = prices[-(four_hour_bars + 1)]
-                metrics['4h_change_pct'] = ((current_price - four_hour_start) / four_hour_start) * 100
-            else:
-                metrics['4h_change_pct'] = 0
-                logging.warning(f"Insufficient 4h data for {symbol}: {four_hour_bars} bars")
-            
-            # 24-hour momentum with proper data validation
-            twenty_four_hour_bars = min(1440, len(prices) - 1)
-            if twenty_four_hour_bars >= 1200:  # Need at least 20 hours of data for reliable 24h calculation
-                day_start = prices[-(twenty_four_hour_bars + 1)]
-                metrics['24h_change_pct'] = ((current_price - day_start) / day_start) * 100
-                logging.debug(f"24h calculation for {symbol}: {twenty_four_hour_bars} bars, "
-                            f"from {day_start:.6f} to {current_price:.6f} = {metrics['24h_change_pct']:.2f}%")
-            else:
-                # If we don't have enough 24h data, return empty metrics
-                # This will cause the momentum filter to reject the trade
-                logging.warning(f"INSUFFICIENT 24H DATA for {symbol}: only {twenty_four_hour_bars} bars available "
-                            f"(need 1200+). Rejecting momentum calculation.")
+            # Get current price first
+            try:
+                ticker = await exchange.fetch_ticker(ccxt_symbol)
+                current_price = float(ticker['close'])
+                
+                # Use exchange's 24h percentage directly (most reliable)
+                metrics['24h_change_pct'] = float(ticker.get('percentage', 0))
+                logging.debug(f"24h change from exchange ticker: {metrics['24h_change_pct']:.2f}%")
+                
+            except Exception as e:
+                logging.warning(f"Failed to get ticker for {symbol}: {e}")
                 return {}
             
-            # Volatility metrics
-            if len(highs) >= 10 and len(lows) >= 10:
-                recent_high = max(highs)
-                recent_low = min(lows)
-                metrics['daily_range_pct'] = ((recent_high - recent_low) / recent_low) * 100 if recent_low > 0 else 0
+            # 1-hour momentum using hourly candles
+            try:
+                h1_candles = await exchange.fetch_ohlcv(ccxt_symbol, '1h', limit=2)
+                if len(h1_candles) >= 2:
+                    prev_h1_close = float(h1_candles[-2][4])  # Previous hour close
+                    current_h1_close = float(h1_candles[-1][4])  # Current hour close
+                    metrics['1h_change_pct'] = ((current_h1_close - prev_h1_close) / prev_h1_close) * 100
+                    logging.debug(f"1h change: {prev_h1_close:.6f} -> {current_h1_close:.6f} = {metrics['1h_change_pct']:.2f}%")
+                else:
+                    # Fallback: current price vs current hour open
+                    if len(h1_candles) >= 1:
+                        current_h1_open = float(h1_candles[-1][1])  # Current hour open
+                        metrics['1h_change_pct'] = ((current_price - current_h1_open) / current_h1_open) * 100
+                    else:
+                        metrics['1h_change_pct'] = 0
+                        logging.warning(f"Insufficient 1h data for {symbol}")
+            except Exception as e:
+                logging.warning(f"1h momentum calculation failed for {symbol}: {e}")
+                metrics['1h_change_pct'] = 0
             
-            # Price volatility (standard deviation)
-            if len(prices) > 1:
-                price_changes = []
-                for i in range(1, len(prices)):
-                    if prices[i-1] > 0:
-                        change = (prices[i] - prices[i-1]) / prices[i-1]
-                        price_changes.append(change)
+            # 4-hour momentum using 4h candles
+            try:
+                h4_candles = await exchange.fetch_ohlcv(ccxt_symbol, '4h', limit=2)
+                if len(h4_candles) >= 2:
+                    prev_h4_close = float(h4_candles[-2][4])  # Previous 4h close
+                    current_h4_close = float(h4_candles[-1][4])  # Current 4h close
+                    metrics['4h_change_pct'] = ((current_h4_close - prev_h4_close) / prev_h4_close) * 100
+                    logging.debug(f"4h change: {prev_h4_close:.6f} -> {current_h4_close:.6f} = {metrics['4h_change_pct']:.2f}%")
+                else:
+                    # Fallback: current price vs current 4h open
+                    if len(h4_candles) >= 1:
+                        current_h4_open = float(h4_candles[-1][1])  # Current 4h open
+                        metrics['4h_change_pct'] = ((current_price - current_h4_open) / current_h4_open) * 100
+                    else:
+                        metrics['4h_change_pct'] = 0
+                        logging.warning(f"Insufficient 4h data for {symbol}")
+            except Exception as e:
+                logging.warning(f"4h momentum calculation failed for {symbol}: {e}")
+                metrics['4h_change_pct'] = 0
+            
+            # Daily volatility range using daily candles
+            try:
+                daily_candles = await exchange.fetch_ohlcv(ccxt_symbol, '1d', limit=2)
+                if len(daily_candles) >= 1:
+                    latest_daily = daily_candles[-1]
+                    daily_high = float(latest_daily[2])
+                    daily_low = float(latest_daily[3])
+                    
+                    if daily_low > 0:
+                        metrics['daily_range_pct'] = ((daily_high - daily_low) / daily_low) * 100
+                    else:
+                        metrics['daily_range_pct'] = 0
+                else:
+                    metrics['daily_range_pct'] = 10  # Default fallback
+            except Exception as e:
+                logging.warning(f"Daily range calculation failed for {symbol}: {e}")
+                metrics['daily_range_pct'] = 10
+            
+            # Volatility calculations using minute data (for fine-grained analysis)
+            try:
+                # Try CCXT Pro data first for volatility
+                klines = []
+                if self.data_manager:
+                    klines = self.data_manager.get_kline_data(symbol, limit=300)
                 
-                if price_changes:
-                    metrics['volatility_1h'] = float(np.std(price_changes[-min(60, len(price_changes)):]) * 100)
-                    metrics['volatility_4h'] = float(np.std(price_changes[-min(240, len(price_changes)):]) * 100)
+                # Fallback to REST API if insufficient CCXT Pro data
+                if len(klines) < 100:
+                    try:
+                        rest_klines = await exchange.fetch_ohlcv(ccxt_symbol, '1m', limit=300)
+                        klines = rest_klines
+                    except Exception as rest_error:
+                        logging.debug(f"REST API volatility fetch failed for {symbol}: {rest_error}")
+                
+                if len(klines) >= 60:
+                    # Convert to price changes
+                    price_changes = []
+                    for i in range(1, len(klines)):
+                        if len(klines[i]) >= 5 and len(klines[i-1]) >= 5:
+                            prev_price = float(klines[i-1][4])
+                            curr_price = float(klines[i][4])
+                            if prev_price > 0:
+                                change = (curr_price - prev_price) / prev_price
+                                price_changes.append(change)
+                    
+                    if price_changes:
+                        # 1h volatility (last 60 changes)
+                        h1_changes = price_changes[-min(60, len(price_changes)):]
+                        metrics['volatility_1h'] = float(np.std(h1_changes) * 100) if h1_changes else 0
+                        
+                        # 4h volatility (last 240 changes)
+                        h4_changes = price_changes[-min(240, len(price_changes)):]
+                        metrics['volatility_4h'] = float(np.std(h4_changes) * 100) if h4_changes else 0
+                    else:
+                        metrics['volatility_1h'] = 0
+                        metrics['volatility_4h'] = 0
                 else:
                     metrics['volatility_1h'] = 0
                     metrics['volatility_4h'] = 0
+                    
+            except Exception as e:
+                logging.debug(f"Volatility calculation failed for {symbol}: {e}")
+                metrics['volatility_1h'] = 0
+                metrics['volatility_4h'] = 0
             
-            # Volume spike detection
-            if volumes:
-                recent_volume_bars = min(240, len(volumes))
-                if recent_volume_bars >= 10:
-                    avg_volume = sum(volumes[-recent_volume_bars:]) / recent_volume_bars
-                    current_volume_bars = min(60, len(volumes))
-                    current_volume = sum(volumes[-current_volume_bars:]) / current_volume_bars if current_volume_bars > 0 else volumes[-1]
-                    metrics['volume_spike_ratio'] = current_volume / avg_volume if avg_volume > 0 else 1
+            # Volume spike detection using ticker data
+            try:
+                volume_24h = float(ticker.get('quoteVolume', 0))
+                # Get historical daily volumes for comparison
+                daily_candles = await exchange.fetch_ohlcv(ccxt_symbol, '1d', limit=7)
+                if len(daily_candles) >= 2:
+                    # Compare current 24h volume to average of last 7 days
+                    volumes = [float(candle[5]) for candle in daily_candles[:-1]]  # Exclude current day
+                    avg_volume = sum(volumes) / len(volumes) if volumes else volume_24h
+                    metrics['volume_spike_ratio'] = volume_24h / avg_volume if avg_volume > 0 else 1
                 else:
                     metrics['volume_spike_ratio'] = 1
-            else:
+            except Exception as e:
+                logging.debug(f"Volume spike calculation failed for {symbol}: {e}")
                 metrics['volume_spike_ratio'] = 1
             
             # Cache the results
@@ -2066,12 +2095,13 @@ class MomentumDetector:
                 'metrics': metrics,
                 'timestamp': time.time(),
                 'price': current_price,
-                'bars_used': len(prices)
+                'source': 'exchange_aligned'
             }
             
             # Enhanced debug logging
             logging.info(f"MOMENTUM {symbol}: 24h={metrics.get('24h_change_pct', 0):.1f}%, "
-                        f"1h={metrics.get('1h_change_pct', 0):.1f}%, bars_used={len(prices)}")
+                        f"4h={metrics.get('4h_change_pct', 0):.1f}%, "
+                        f"1h={metrics.get('1h_change_pct', 0):.1f}% (exchange-aligned)")
             
             return metrics
             
